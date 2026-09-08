@@ -1,0 +1,32 @@
+[package]
+name = "trainpool"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+description = "Capacity-first distributed logical training memory research runtime"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+blake3 = "1"
+clap = { version = "4", features = ["derive", "env"] }
+hex = "0.4"
+hmac = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+socket2 = { version = "0.6", features = ["all"] }
+sysinfo = "0.39"
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "trainpool"
+path = "src/main.rs"

@@ -1,0 +1,9 @@
+TrainPool
+Copyright 2026 TrainPool contributors
+
+This project is an independent research implementation.
+It does not contain NVIDIA Personal AI Router source code.
+
+Dependency licenses remain with their respective authors. Cargo.lock records Rust
+dependencies; Python package metadata records Python dependencies. NVIDIA drivers
+and PyTorch are external components and are not included in the TrainPool source.
