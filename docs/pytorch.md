@@ -4,7 +4,30 @@ The SDK is a library in `python/trainpool_torch`, not a second daemon. It requir
 local loopback TrainPool endpoint and contains no torch.distributed RPC, pickle or
 remote Python execution. RAM-only peers need only the Rust binary.
 
-## Three levels
+## Normal transparent execution
+
+Run an unchanged program with `trainpool python train.py`. A temporary, process-local
+`sitecustomize.py` calls `trainpool_torch.bootstrap.autoinstall()` only when the launcher
+sets `TRAINPOOL_ACTIVE=1`. Importing `trainpool_torch` normally still imports neither
+PyTorch nor CUDA.
+
+The bootstrap intercepts CUDA movement for supported nonempty `nn.Sequential` models
+before PyTorch materializes the whole model in VRAM. It preserves model identity,
+attaches the existing stage runtime, discovers fresh SGD/Adam/AdamW optimizers in either
+common construction order, preserves optimizer identity and parameter groups, and
+delegates forward, backward state handling, `zero_grad()` and `step()`. Transparent
+stores use automatic placement (`preferred_node=None`). Model `state_dict()` and
+optimizer `state_dict()` restore ordinary CPU tensors sequentially; their
+`load_state_dict()` methods currently fail explicitly rather than risking corruption.
+
+Compatibility is reported as FULL, PARTIAL, or UNSUPPORTED. FULL currently means the
+sequential restrictions below are satisfied and parameters, recomputed/saved inputs,
+gradients, and optimizer state use the capacity runtime. PARTIAL does not claim to solve
+model OOM. Unsupported CUDA model movement raises `TRAINPOOL_UNSUPPORTED_GRAPH` before
+ordinary full-model CUDA movement. Ultralytics may be named in diagnostics, but YOLO is
+not claimed as FULL-compatible.
+
+## Advanced explicit APIs
 
 `TensorStore.offload(tensor)` returns a logical `TensorHandle` containing full shape,
 dtype, byte length, original device, contiguous layout, expected next use, dirty/clean
@@ -17,7 +40,7 @@ the store and unpack them for backward. The restored values have identical dtype
 shape and content. Tensor ownership objects release blocks when the autograd graph
 releases them; the context closes any remaining objects. Finish backward inside the
 context. This mechanism alone does not release ordinary model parameters or optimizer
-states: use `prepare` to manage those objects at explicit stage boundaries.
+states. It remains a research/debugging interface.
 
 `prepare(nn.Sequential, optimizer)` transfers ownership and returns a
 `CapacitySequential` and `CapacityOptimizer`. It supports SGD, Adam and AdamW with one
@@ -81,7 +104,7 @@ Unsupported: arbitrary graphs, DDP, automatic graph partitioning, multiple GPU e
 multiple optimizer groups, populated pre-prepare optimizer state, closures, differentiable/
 capturable/fused optimizers, automatic mixed precision/GradScaler integration, gradient
 accumulation, retained graphs, higher-order gradients, shared weights, sparse/quantized
-tensors, and transparent standard `state_dict`/optimizer serialization. Use
+tensors, and transparent checkpoint loading. Use
 `named_training_parameters(device=...)` to inspect one restored parameter at a time.
 Collecting that iterator into a dict deliberately materializes a full snapshot in RAM.
 
@@ -93,8 +116,10 @@ without saving backward inputs.
 CUDA mode verifies both PyTorch CUDA availability and that the local daemon is the
 single planned GPU compute provider. A CPU-only leader cannot execute a CUDA stage.
 `_test_cpu=True` plus `device="cpu"` is an explicit numerical test backend; it is never
-selected from tensor location or driver failure. `examples/train_sequential.py --test-cpu`
-labels its output as simulation.
+selected from tensor location or driver failure. Transparent subprocess tests use the
+equally test-only `TRAINPOOL_TEST_CPU=1` switch and report `backend=test-cpu`; production
+does not select it automatically. `examples/train_sequential.py --test-cpu` labels its
+output as simulation.
 
 ## Metrics and cleanup
 
@@ -104,8 +129,10 @@ Allocator numbers are process observations; use one job per process when attribu
 them to a job. Waiting time is wall time blocked on data, not a CUDA profiler's exact
 GPU-idle measurement. There is no fabricated GPU metric for the CPU backend.
 
-Use `try/finally: model.close()` or a `TensorStore` context, and close the prefetcher
-before closing a supplied store. A lease renewal thread retains live RAM objects.
+Transparent mode registers `atexit` cleanup for stores and prefetch workers. Explicit
+mode should use `try/finally: model.close()` or a `TensorStore` context, and close the
+prefetcher before closing a supplied store. A lease renewal thread retains live RAM
+objects.
 If cleanup cannot reach a node, expiry bounds retention; the cleanup warning identifies
 this rather than pretending all remote allocations were freed.
 

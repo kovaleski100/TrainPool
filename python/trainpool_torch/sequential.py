@@ -7,6 +7,8 @@ No arbitrary graph interception, remote Python workers, or CPU CUDA fallback.
 from __future__ import annotations
 
 import contextlib
+import types
+from collections import OrderedDict
 from dataclasses import dataclass, field
 
 import torch
@@ -121,10 +123,10 @@ class _SequentialAutograd(torch.autograd.Function):
                     runtime.store.free(saved)
 
 
-class CapacitySequential(nn.Module):
+class SequentialRuntime:
+    """Capacity state machine independent of the user's ``nn.Module`` identity."""
+
     def __init__(self, stages, store, device, prefetch_depth, gpu_budget_bytes):
-        super().__init__()
-        self.templates = nn.ModuleList([s.template for s in stages])
         self.stages = stages
         self.store = store
         self.device = device
@@ -133,6 +135,7 @@ class CapacitySequential(nn.Module):
         self.pending = False
         self.backward_complete = False
         self.failed = False
+        self.closed = False
 
     def load_weights(self, index):
         return {
@@ -144,7 +147,7 @@ class CapacitySequential(nn.Module):
         if 0 <= index < len(self.stages):
             self.prefetch.schedule((phase, index), lambda: self.load_weights(index))
 
-    def forward(self, value):
+    def forward(self, value, *, training=True):
         if value.device != self.device:
             raise TrainPoolError(f"TRAINPOOL_NO_CUDA_FALLBACK: input must be on {self.device}")
         if self.failed:
@@ -161,7 +164,7 @@ class CapacitySequential(nn.Module):
                 raise TrainPoolError(
                     f"TRAINPOOL_STAGE_TOO_LARGE: estimate {required} exceeds stage budget {self.gpu_budget_bytes}"
                 )
-        if not self.training or not torch.is_grad_enabled():
+        if not training or not torch.is_grad_enabled():
             with torch.no_grad():
                 for index, record in enumerate(self.stages):
                     weights = self.load_weights(index)
@@ -179,14 +182,90 @@ class CapacitySequential(nn.Module):
             for name, handle in record.weights.items():
                 yield f"{index}.{name}", self.store.restore(handle, device=device)
 
+    def convert_dtype(self, dtype):
+        """Apply a dtype-only module conversion to remote weights stage by stage."""
+        for record in self.stages:
+            replacements = {
+                name: self.store.offload(
+                    self.store.restore(handle, device="cpu").to(dtype=dtype),
+                    expected_next_use="forward",
+                )
+                for name, handle in record.weights.items()
+            }
+            for name, replacement in replacements.items():
+                self.store.free(record.weights[name])
+                record.weights[name] = replacement
+            record.template.to(dtype=dtype)
+
     def close(self):
+        if self.closed:
+            return
+        self.closed = True
         self.prefetch.close()
         self.store.close()
 
 
+class CapacitySequential(nn.Module):
+    """Backward-compatible explicit wrapper around :class:`SequentialRuntime`."""
+
+    def __init__(self, runtime):
+        super().__init__()
+        self.templates = nn.ModuleList([s.template for s in runtime.stages])
+        object.__setattr__(self, "runtime", runtime)
+
+    @property
+    def stages(self):
+        return self.runtime.stages
+
+    @property
+    def store(self):
+        return self.runtime.store
+
+    @property
+    def device(self):
+        return self.runtime.device
+
+    @property
+    def prefetch(self):
+        return self.runtime.prefetch
+
+    @property
+    def pending(self):
+        return self.runtime.pending
+
+    @pending.setter
+    def pending(self, value):
+        self.runtime.pending = value
+
+    @property
+    def backward_complete(self):
+        return self.runtime.backward_complete
+
+    @backward_complete.setter
+    def backward_complete(self, value):
+        self.runtime.backward_complete = value
+
+    @property
+    def failed(self):
+        return self.runtime.failed
+
+    @failed.setter
+    def failed(self, value):
+        self.runtime.failed = value
+
+    def forward(self, value):
+        return self.runtime.forward(value, training=self.training)
+
+    def named_training_parameters(self, *, device="cpu"):
+        yield from self.runtime.named_training_parameters(device=device)
+
+    def close(self):
+        self.runtime.close()
+
+
 class CapacityOptimizer:
     def __init__(self, model, optimizer_type, options):
-        self.model = model
+        self.model = model.runtime if isinstance(model, CapacitySequential) else model
         self.optimizer_type = optimizer_type
         self.options = options
 
@@ -217,7 +296,9 @@ class CapacityOptimizer:
                     for name in record.weights
                     if name in record.trainable
                 }
-                optimizer = self.optimizer_type(list(parameters.values()), **self.options)
+                guard = getattr(model, "instrumentation_guard", contextlib.nullcontext)
+                with guard():
+                    optimizer = self.optimizer_type(list(parameters.values()), **self.options)
                 for name, parameter in parameters.items():
                     if name in record.gradients:
                         parameter.grad = model.store.restore(record.gradients[name], device=model.device)
@@ -261,58 +342,15 @@ class CapacityOptimizer:
             raise
 
 
-def prepare(
-    model,
-    optimizer,
-    *,
-    mode="capacity",
-    device="cuda",
-    store=None,
-    preferred_node=None,
-    prefetch_depth=1,
-    gpu_budget_bytes=None,
-    _test_cpu=False,
-):
-    """Transfer ownership of an explicit Sequential and fresh SGD/Adam/AdamW.
+SUPPORTED_OPTIMIZERS = (torch.optim.SGD, torch.optim.Adam, torch.optim.AdamW)
 
-    Do not reuse the input model or optimizer after preparation. The returned
-    model owns meta templates and remote parameters. CPU execution is confined to
-    the explicitly selected test backend, never chosen from memory placement.
-    """
-    if mode != "capacity" or not isinstance(model, nn.Sequential) or not len(model):
+
+def _validate_model(model):
+    if not isinstance(model, nn.Sequential) or not len(model):
         raise ValueError("prepare currently supports nonempty nn.Sequential in capacity mode")
-    if type(optimizer) not in (torch.optim.SGD, torch.optim.Adam, torch.optim.AdamW):
-        raise ValueError("Only SGD, Adam and AdamW optimizers are supported")
-    if len(optimizer.param_groups) != 1 or optimizer.state:
-        raise ValueError("The MVP requires one parameter group and a fresh optimizer")
-    if prefetch_depth not in (0, 1):
-        raise ValueError("prefetch_depth must be 0 or 1")
-    target = torch.device(device)
-    if target.type == "cpu" and not _test_cpu:
-        raise TrainPoolError("TRAINPOOL_NO_CUDA: CPU execution requires the explicit test backend")
-    if target.type not in ("cuda", "cpu"):
-        raise ValueError("Unsupported compute device")
-    if target.type == "cuda":
-        if not torch.cuda.is_available():
-            raise TrainPoolError("TRAINPOOL_NO_CUDA: run this script on the GPU node with CUDA PyTorch")
-        target = torch.device(
-            "cuda", target.index if target.index is not None else torch.cuda.current_device()
-        )
-    options = {k: v for k, v in optimizer.param_groups[0].items() if k != "params"}
-    options.pop("initial_lr", None)
-    if type(optimizer) is torch.optim.AdamW:
-        # AdamW stores this inherited Adam flag but does not accept it in __init__.
-        options.pop("decoupled_weight_decay", None)
-    if options.get("differentiable") or options.get("capturable") or options.get("fused"):
-        raise ValueError("Differentiable, capturable and fused optimizers are unsupported")
-    options["foreach"] = False
     all_parameters = list(model.named_parameters(remove_duplicate=False))
-    if len({id(p) for _, p in all_parameters}) != len(all_parameters):
+    if len({id(parameter) for _, parameter in all_parameters}) != len(all_parameters):
         raise ValueError("Tied/shared parameters are unsupported")
-    if {id(p) for _, p in all_parameters if p.requires_grad} != {
-        id(p) for p in optimizer.param_groups[0]["params"] if p.requires_grad
-    }:
-        raise ValueError("Optimizer parameters must match the sequential model")
     allowed = (
         nn.Linear,
         nn.ReLU,
@@ -334,8 +372,200 @@ def prepare(
         if list(block.buffers()):
             raise ValueError("Mutable/stateful buffers are unsupported; use pure stages")
         if not getattr(block, "_trainpool_explicit_stage", False):
-            if any(type(m) not in allowed or getattr(m, "inplace", False) for m in block.modules()):
+            if any(
+                type(module) not in allowed or getattr(module, "inplace", False)
+                for module in block.modules()
+            ):
                 raise ValueError("Unknown stage: annotate a pure block with trainpool_torch.stage()")
+    return all_parameters
+
+
+def _target_device(device, *, test_cpu):
+    target = torch.device(device)
+    if target.type == "cpu" and not test_cpu:
+        raise TrainPoolError("TRAINPOOL_NO_CUDA: CPU execution requires the explicit test backend")
+    if target.type not in ("cuda", "cpu"):
+        raise ValueError("Unsupported compute device")
+    if target.type == "cuda":
+        if not torch.cuda.is_available():
+            raise TrainPoolError("TRAINPOOL_NO_CUDA: run this script on the GPU node with CUDA PyTorch")
+        target = torch.device(
+            "cuda", target.index if target.index is not None else torch.cuda.current_device()
+        )
+    return target
+
+
+def _optimizer_options(optimizer):
+    if type(optimizer) not in SUPPORTED_OPTIMIZERS:
+        raise ValueError("Only SGD, Adam and AdamW optimizers are supported")
+    if len(optimizer.param_groups) != 1 or optimizer.state:
+        raise ValueError("The MVP requires one parameter group and a fresh optimizer")
+    options = {key: value for key, value in optimizer.param_groups[0].items() if key != "params"}
+    options.pop("initial_lr", None)
+    if type(optimizer) is torch.optim.AdamW:
+        options.pop("decoupled_weight_decay", None)
+    if options.get("differentiable") or options.get("capturable") or options.get("fused"):
+        raise ValueError("Differentiable, capturable and fused optimizers are unsupported")
+    options["foreach"] = False
+    return options
+
+
+def build_sequential_runtime(
+    model,
+    *,
+    device,
+    store,
+    prefetch_depth=1,
+    gpu_budget_bytes=None,
+):
+    """Move a validated Sequential's state into the fabric and return its runtime."""
+    records = []
+    for block in model:
+        named = dict(block.named_parameters())
+        weights = {
+            name: store.offload(parameter, expected_next_use="forward")
+            for name, parameter in named.items()
+        }
+        trainable = {name for name, parameter in named.items() if parameter.requires_grad}
+        block.to("meta")
+        records.append(_Stage(block, weights, trainable))
+    return SequentialRuntime(records, store, device, prefetch_depth, gpu_budget_bytes)
+
+
+def prepare_model_inplace(
+    model,
+    *,
+    device,
+    store,
+    prefetch_depth=1,
+    gpu_budget_bytes=None,
+):
+    """Attach capacity execution to the same model object."""
+    _validate_model(model)
+    runtime = build_sequential_runtime(
+        model,
+        device=device,
+        store=store,
+        prefetch_depth=prefetch_depth,
+        gpu_budget_bytes=gpu_budget_bytes,
+    )
+
+    def transparent_forward(owner, value, *args, **kwargs):
+        if args or kwargs:
+            raise TrainPoolError(
+                "TRAINPOOL_UNSUPPORTED_GRAPH: FULL sequential mode accepts one tensor input"
+            )
+        return runtime.forward(value, training=owner.training)
+
+    def transparent_state_dict(owner, destination=None, prefix="", keep_vars=False):
+        del owner
+        if destination is None:
+            destination = OrderedDict()
+            destination._metadata = OrderedDict()
+        for index, record in enumerate(runtime.stages):
+            for name, handle in record.weights.items():
+                tensor = runtime.store.restore(handle, device="cpu")
+                destination[f"{prefix}{index}.{name}"] = tensor if keep_vars else tensor.detach()
+        return destination
+
+    def unsupported_load_state_dict(owner, *args, **kwargs):
+        del owner, args, kwargs
+        raise TrainPoolError(
+            "TRAINPOOL_CHECKPOINT_UNSUPPORTED: load_state_dict is not yet safe for a prepared model"
+        )
+
+    def transparent_close(owner):
+        del owner
+        runtime.close()
+
+    object.__setattr__(model, "_trainpool_runtime", runtime)
+    object.__setattr__(model, "forward", types.MethodType(transparent_forward, model))
+    object.__setattr__(model, "state_dict", types.MethodType(transparent_state_dict, model))
+    object.__setattr__(model, "load_state_dict", types.MethodType(unsupported_load_state_dict, model))
+    object.__setattr__(model, "close", types.MethodType(transparent_close, model))
+    return runtime
+
+
+def attach_optimizer_inplace(optimizer, runtime):
+    """Delegate a supported optimizer without replacing or emptying it."""
+    options = _optimizer_options(optimizer)
+    delegate = CapacityOptimizer(runtime, type(optimizer), options)
+
+    def zero_grad(owner, set_to_none=True):
+        del owner
+        return delegate.zero_grad(set_to_none=set_to_none)
+
+    def step(owner, closure=None):
+        delegate.options = _optimizer_options(owner)
+        return delegate.step(closure=closure)
+
+    def state_dict(owner):
+        groups = []
+        next_index = 0
+        for group in owner.param_groups:
+            encoded = {key: value for key, value in group.items() if key != "params"}
+            encoded["params"] = []
+            for _parameter in group["params"]:
+                encoded["params"].append(next_index)
+                next_index += 1
+            groups.append(encoded)
+        state = {}
+        index = 0
+        for record in runtime.stages:
+            for name in record.weights:
+                values = record.optimizer_state.get(name)
+                if values:
+                    state[index] = {
+                        key: runtime.store.restore(value, device="cpu")
+                        if isinstance(value, TensorHandle)
+                        else value
+                        for key, value in values.items()
+                    }
+                index += 1
+        return {"state": state, "param_groups": groups}
+
+    def unsupported_load_state_dict(owner, *args, **kwargs):
+        del owner, args, kwargs
+        raise TrainPoolError(
+            "TRAINPOOL_CHECKPOINT_UNSUPPORTED: optimizer.load_state_dict is not yet safe in FULL mode"
+        )
+
+    object.__setattr__(optimizer, "_trainpool_delegate", delegate)
+    object.__setattr__(optimizer, "zero_grad", types.MethodType(zero_grad, optimizer))
+    object.__setattr__(optimizer, "step", types.MethodType(step, optimizer))
+    object.__setattr__(optimizer, "state_dict", types.MethodType(state_dict, optimizer))
+    object.__setattr__(
+        optimizer,
+        "load_state_dict",
+        types.MethodType(unsupported_load_state_dict, optimizer),
+    )
+    return optimizer
+
+
+def prepare(
+    model,
+    optimizer,
+    *,
+    mode="capacity",
+    device="cuda",
+    store=None,
+    preferred_node=None,
+    prefetch_depth=1,
+    gpu_budget_bytes=None,
+    _test_cpu=False,
+):
+    """Transfer ownership to the backward-compatible explicit wrapper API."""
+    if mode != "capacity" or not isinstance(model, nn.Sequential) or not len(model):
+        raise ValueError("prepare currently supports nonempty nn.Sequential in capacity mode")
+    if prefetch_depth not in (0, 1):
+        raise ValueError("prefetch_depth must be 0 or 1")
+    all_parameters = _validate_model(model)
+    options = _optimizer_options(optimizer)
+    if {id(parameter) for _, parameter in all_parameters if parameter.requires_grad} != {
+        id(parameter) for parameter in optimizer.param_groups[0]["params"] if parameter.requires_grad
+    }:
+        raise ValueError("Optimizer parameters must match the sequential model")
+    target = _target_device(device, test_cpu=_test_cpu)
     own_store = store is None
     store = store or TensorStore(preferred_node=preferred_node)
     if target.type == "cuda":
@@ -350,22 +580,19 @@ def prepare(
             )
         if gpu_budget_bytes is None:
             gpu_budget_bytes = store.plan["gpu_assignments"][0]["usable_bytes"]
-    records = []
     try:
         # Clear optimizer ownership before progressively releasing the original modules.
         optimizer.param_groups[0]["params"] = []
-        for block in model:
-            named = dict(block.named_parameters())
-            weights = {
-                name: store.offload(parameter, expected_next_use="forward")
-                for name, parameter in named.items()
-            }
-            trainable = {name for name, parameter in named.items() if parameter.requires_grad}
-            block.to("meta")
-            records.append(_Stage(block, weights, trainable))
-        prepared = CapacitySequential(records, store, target, prefetch_depth, gpu_budget_bytes)
+        runtime = build_sequential_runtime(
+            model,
+            device=target,
+            store=store,
+            prefetch_depth=prefetch_depth,
+            gpu_budget_bytes=gpu_budget_bytes,
+        )
+        prepared = CapacitySequential(runtime)
         prepared.train(model.training)
-        return prepared, CapacityOptimizer(prepared, type(optimizer), options)
+        return prepared, CapacityOptimizer(runtime, type(optimizer), options)
     except BaseException:
         if own_store:
             store.close()

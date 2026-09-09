@@ -22,6 +22,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{Mutex, RwLock, Semaphore},
+    task::JoinHandle,
 };
 use uuid::Uuid;
 
@@ -170,7 +171,41 @@ impl Runtime {
     }
 }
 
-pub async fn daemon(config: Config, id: Uuid) -> Result<()> {
+/// A running local TrainPool node. Dropping the handle stops all background work.
+/// This is shared by the foreground daemon command and the transparent launcher.
+pub struct RuntimeHandle {
+    pub runtime: Arc<Runtime>,
+    server: JoinHandle<Result<()>>,
+    monitor: JoinHandle<()>,
+    receiver: Option<JoinHandle<()>>,
+}
+
+impl RuntimeHandle {
+    pub async fn shutdown(mut self) {
+        self.server.abort();
+        self.monitor.abort();
+        if let Some(receiver) = &mut self.receiver {
+            receiver.abort();
+        }
+        let _ = (&mut self.server).await;
+        let _ = (&mut self.monitor).await;
+        if let Some(receiver) = &mut self.receiver {
+            let _ = receiver.await;
+        }
+    }
+}
+
+impl Drop for RuntimeHandle {
+    fn drop(&mut self) {
+        self.server.abort();
+        self.monitor.abort();
+        if let Some(receiver) = &self.receiver {
+            receiver.abort();
+        }
+    }
+}
+
+pub async fn start_runtime(config: Config, id: Uuid) -> Result<RuntimeHandle> {
     let listener = TcpListener::bind(config.listen).await?;
     let runtime = Runtime::new(config.clone(), id).await?;
     let discovery = if config.discovery_enabled {
@@ -187,13 +222,20 @@ pub async fn daemon(config: Config, id: Uuid) -> Result<()> {
     tracing::info!(node_id = %id, address = %runtime.local().await.network.control_address, gpu_compute = runtime.local().await.runtime.gpu_compute, "TrainPool daemon ready; disk spill disabled");
     let monitor = tokio::spawn(runtime.clone().monitor(discovery.clone()));
     let receiver = discovery.map(|d| tokio::spawn(runtime.clone().discover(d)));
+    let server = tokio::spawn(runtime.clone().serve(listener));
+    Ok(RuntimeHandle {
+        runtime,
+        server,
+        monitor,
+        receiver,
+    })
+}
+
+pub async fn daemon(config: Config, id: Uuid) -> Result<()> {
+    let mut handle = start_runtime(config, id).await?;
     tokio::select! {
-        result = runtime.clone().serve(listener) => { result?; },
+        result = &mut handle.server => { result??; },
         result = tokio::signal::ctrl_c() => { result?; },
-    }
-    monitor.abort();
-    if let Some(r) = receiver {
-        r.abort();
     }
     Ok(())
 }

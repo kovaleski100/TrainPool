@@ -958,6 +958,7 @@ dependencies = [
  "clap",
  "hex",
  "hmac",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

@@ -2,6 +2,7 @@ pub mod cli;
 pub mod cluster;
 pub mod config;
 pub mod jobs;
+pub mod launcher;
 pub mod memory;
 pub mod metrics;
 pub mod node;

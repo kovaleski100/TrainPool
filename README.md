@@ -17,15 +17,17 @@ Tensor files, disk spill and TrainPool-managed swap are absent from the implemen
   BLAKE3 checksums, chunked transfers, lease renewal/free and direct node-to-node migration.
 * CPU-only RAM providers, a single-GPU training plan, explicit heterogeneous stage
   planning, topology estimates and on-demand directed bandwidth measurements.
-* PyTorch tensor offload/restore, saved activation hooks and actual sequential training
-  with remote parameters, inputs, gradients and SGD/Adam/AdamW optimizer state.
+* Transparent PyTorch activation through `trainpool python ...`, plus tensor
+  offload/restore, saved activation hooks and actual sequential training with remote
+  parameters, inputs, gradients and SGD/Adam/AdamW optimizer state.
 * One-stage look-ahead prefetch, structured logs, per-job counters and repeatable tests.
 
-**Scope:** actual training execution supports one GPU and explicitly separated pure
-sequential stages. The heterogeneous GPU planner generates unequal stage assignments;
-cross-host multi-GPU execution is not implemented. CUDA execution requires the Python
-script to run on the GPU node. CPU execution is available only through an explicit test
-backend. The Rust daemon has no remote shell or Python execution endpoint.
+**Scope:** transparent FULL mode supports the subset of nonempty `nn.Sequential`
+models accepted by the existing pure-stage capacity runtime, with one fresh
+SGD/Adam/AdamW parameter group. Arbitrary graphs and cross-host multi-GPU execution
+remain future work. With several discovered GPUs and no explicit stage assignments,
+TrainPool deterministically selects the largest usable GPU for this job; it does not
+claim the other GPUs' VRAM as active capacity. CPU execution is test-only.
 
 ## Build
 
@@ -51,13 +53,38 @@ pip install -e ./python
 # Install PyTorch following https://pytorch.org/get-started/locally/.
 ```
 
-## Run on two machines
+## Quick start
 
-Run the **same binary** on both machines on a trusted LAN:
+Install the Python adapter in the training interpreter, then run the same TrainPool
+binary on participating machines. A RAM-provider machine runs:
 
 ```sh
 trainpool daemon
 ```
+
+On the compute machine, change only the command line:
+
+```sh
+# Before
+python train.py
+
+# With TrainPool (the local runtime starts automatically if needed)
+trainpool python train.py
+trainpool python train.py --epochs 100
+trainpool python -m package.training
+
+trainpool metrics
+```
+
+`train.py` must not import TrainPool. The launcher verifies that its exact Python
+interpreter contains `trainpool_torch`, obtains a training plan, starts or reuses one
+local daemon, injects a process-local Python bootstrap, and cleans it up when the child
+exits. Existing environment settings, including virtualenv/Conda selection and
+`CUDA_VISIBLE_DEVICES`, are inherited.
+
+The legacy `trainpool run -- python train.py` spelling remains an alias.
+
+### Cluster inspection
 
 Default ports: TCP 7432 for framed control/data connections, UDP multicast
 239.255.74.32:7433 for discovery. Permit these on the participating network interfaces.
@@ -77,6 +104,8 @@ trainpool metrics --json
 experiment. `benchmark` asks the leader to measure all directed peer pairs. Ordinary
 heartbeats measure control RTT without sending bandwidth-test payloads.
 
+### Advanced raw-memory exercise
+
 To exercise remote capacity safely, limit the GPU host's contribution and provide
 more RAM on the second host. These are contribution ceilings, not fictitious physical
 memory or GPU capacity:
@@ -94,7 +123,9 @@ The demo creates 12 MiB using 512 KiB blocks, reads and checks every block, prin
 remote bytes and metrics, and frees the blocks. It requires actual remote placement
 to pass. It exceeds A's configured contribution while keeping local staging bounded.
 
-For CUDA training, choose a larger contribution ceiling on B and use its UUID:
+For CUDA training, choose a larger contribution ceiling on B. Automatic allocation
+uses the existing local-first/cost/capacity/pressure/load placement policy; no node UUID
+belongs in the normal training command:
 
 ```sh
 # Machine A: restart with room for 1 MiB tensor staging.
@@ -102,8 +133,7 @@ trainpool daemon --ram-limit-mib 16
 # Machine B: restart with a suitable safe ceiling, e.g. 1024 MiB.
 trainpool daemon --ram-limit-mib 1024
 # Machine A:
-trainpool nodes
-trainpool run -- python examples/train_sequential.py --memory-node B_UUID
+trainpool python train.py
 ```
 
 The default model has more than 64 MiB of parameters and uses a configured 64 MiB
@@ -115,7 +145,10 @@ The configured budget is an admission estimate, **not a CUDA allocator hard limi
 Physical-OOM comparisons require running the baseline and measuring both processes
 on the target GPU; the CPU simulation does not establish that result.
 
-Minimal adapter usage:
+## Advanced Python API
+
+The explicit adapter remains available for research, debugging, placement experiments,
+and stage annotation. It is not required by normal training programs:
 
 ```python
 import torch
@@ -138,9 +171,10 @@ finally:
 ```
 
 `prepare` transfers ownership: the original model becomes meta templates and the
-original optimizer relinquishes its parameters. Use the returned pair. For saved
-activations alone, keep both forward and backward inside `with tp.distributed_memory():`.
-See [adapter semantics](docs/pytorch.md) for supported modules and restrictions.
+original optimizer relinquishes its parameters. `TensorStore(preferred_node=...)`,
+`distributed_memory()` and `stage()` are likewise advanced interfaces. Transparent
+stores always pass `preferred_node=None`. See [adapter semantics](docs/pytorch.md) for
+supported modules and restrictions.
 
 ## Reproduce without a GPU
 
@@ -197,7 +231,7 @@ export TRAINPOOL_CLUSTER_SECRET='your-own-high-entropy-shared-secret'
 
 Alternatively persist `cluster-name`/`cluster-secret` using `config set`. `config show`
 redacts the secret. The SDK reads `TRAINPOOL_ADDRESS`, `TRAINPOOL_CLUSTER_NAME` and
-`TRAINPOOL_CLUSTER_SECRET`; `trainpool run` propagates these automatically. Python
+`TRAINPOOL_CLUSTER_SECRET`; the launcher propagates these automatically. Python
 connects only to a loopback address, never directly to remote peers.
 
 This framed TCP MVP authenticates peers using challenge-response HMAC-SHA256 and signs

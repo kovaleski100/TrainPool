@@ -84,8 +84,10 @@ background bulk bandwidth test. Reported RTT includes authentication/dispatch ov
 A `TrainingPlan` records job ID, leader generation, GPU assignments, compute node IDs,
 RAM node IDs, placement policy, memory budget snapshot, topology snapshot and explicit
 stage assignments. A node with `gpu_compute=false` cannot receive a GPU assignment.
-No GPU produces `MemoryOnly`; exactly one usable GPU produces
-`SingleGpuDistributedMemory`.
+No GPU produces `MemoryOnly`. With no explicit stage descriptions, one or more usable
+GPUs produce an executable `SingleGpuDistributedMemory` plan containing only the
+largest usable GPU (then stable GPU/node ID). The other GPUs remain visible inventory;
+their VRAM is not counted as participating in that job.
 
 The experimental heterogeneous planner accepts `{name, working_set_bytes}` stage
 descriptions. It places each complete stage only on a GPU with enough usable capacity
@@ -93,7 +95,8 @@ and balances accumulated stage bytes relative to each GPU's usable capacity. Cap
 shares derive from real usable VRAM, not equal `1/N` partitions. The working set must
 include the caller's estimates for activations, gradients and operator workspace.
 
-Stage plans are implemented and tested; executing those plans across GPU hosts is not.
+Explicit multi-GPU stage plans are implemented and tested; executing those plans across
+GPU hosts is not.
 `execution_supported=false` makes this explicit in experimental plans. The Python
 sequential adapter deliberately rejects such a plan. Future execution needs a bounded,
 typed module/operator protocol, validation of model definitions and cross-stage gradient

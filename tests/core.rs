@@ -103,6 +103,19 @@ fn unequal_gpu_stages_obey_working_set_capacity() {
             .is_err()
     );
 }
+
+#[test]
+fn automatic_multi_gpu_plan_selects_largest_primary() {
+    let nodes = vec![node(1, 32, Some(12)), node(2, 32, Some(4))];
+    let plan = CapacityPlanner
+        .plan(&nodes, &elect(nodes.iter()), &Topology::default(), &[])
+        .unwrap();
+    assert_eq!(plan.strategy, "SingleGpuDistributedMemory");
+    assert!(plan.execution_supported);
+    assert_eq!(plan.gpu_assignments.len(), 1);
+    assert_eq!(plan.gpu_assignments[0].node_id, nodes[0].node_id);
+    assert_eq!(plan.compute_nodes, vec![nodes[0].node_id]);
+}
 #[test]
 fn leader_times_out_and_is_reelected() {
     let a = node(1, 32, None);

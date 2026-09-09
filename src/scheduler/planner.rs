@@ -78,7 +78,15 @@ impl TrainingPlanner for CapacityPlanner {
             b.usable_bytes
                 .cmp(&a.usable_bytes)
                 .then(a.gpu_id.cmp(&b.gpu_id))
+                .then(a.node_id.cmp(&b.node_id))
         });
+        // Automatic capacity execution currently uses exactly one compute GPU.
+        // Additional GPUs remain cluster resources, but are not presented as if
+        // their VRAM participated in this job.
+        if stages.is_empty() && !gpus.is_empty() {
+            gpus.truncate(1);
+            gpus[0].capacity_share = 1.0;
+        }
         let mut loads = vec![0_u64; gpus.len()];
         let mut assignments = vec![];
         for stage in stages {

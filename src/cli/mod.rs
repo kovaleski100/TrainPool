@@ -62,6 +62,8 @@ pub enum Command {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         argv: Vec<OsString>,
     },
+    #[command(external_subcommand)]
+    External(Vec<OsString>),
 }
 #[derive(Subcommand)]
 pub enum ConfigCommand {
@@ -150,6 +152,14 @@ pub async fn execute(cli: Cli) -> Result<()> {
     let transport = TcpTransport {
         config: config.clone(),
     };
+    if let Command::Run { argv } | Command::External(argv) = &cli.command {
+        let code =
+            crate::launcher::launch(argv.clone(), config.clone(), &cli.data_dir, address).await?;
+        if code != 0 {
+            std::process::exit(code);
+        }
+        return Ok(());
+    }
     let request = match &cli.command {
         Command::Topology => Request::Topology,
         Command::Metrics => Request::Metrics,
@@ -158,28 +168,12 @@ pub async fn execute(cli: Cli) -> Result<()> {
                 .checked_mul(1024 * 1024)
                 .ok_or_else(|| anyhow::anyhow!("benchmark size overflow"))?,
         },
-        Command::Plan | Command::Run { .. } => Request::Plan { stages: vec![] },
+        Command::Plan => Request::Plan { stages: vec![] },
+        Command::Run { .. } | Command::External(_) => unreachable!("launches were handled above"),
         _ => Request::Status,
     };
     let response = transport.control(address, &request).await?;
     response.check()?;
-    if let Command::Run { argv } = cli.command {
-        let mut command = tokio::process::Command::new(&argv[0]);
-        command
-            .args(&argv[1..])
-            .env("TRAINPOOL_ADDRESS", address.to_string())
-            .env("TRAINPOOL_CLUSTER_NAME", &config.cluster_name)
-            .env(
-                "TRAINPOOL_JOB_ID",
-                response.data["job_id"].as_str().unwrap_or(""),
-            );
-        if let Some(secret) = &config.cluster_secret {
-            command.env("TRAINPOOL_CLUSTER_SECRET", secret);
-        }
-        let status = command.status().await?;
-        ensure!(status.success(), "training process failed: {status}");
-        return Ok(());
-    }
     if cli.json || matches!(cli.command, Command::Metrics | Command::Plan) {
         println!("{}", serde_json::to_string_pretty(&response.data)?);
         return Ok(());
@@ -272,4 +266,34 @@ pub async fn execute(cli: Cli) -> Result<()> {
 }
 fn gib(bytes: u64) -> String {
     format!("{:.2} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn external_program_is_captured_verbatim() {
+        let cli =
+            Cli::try_parse_from(["trainpool", "python", "train.py", "--epochs", "100"]).unwrap();
+        let Command::External(argv) = cli.command else {
+            panic!("expected external command");
+        };
+        assert_eq!(
+            argv,
+            ["python", "train.py", "--epochs", "100"].map(OsString::from)
+        );
+    }
+
+    #[test]
+    fn built_in_command_still_wins() {
+        let cli = Cli::try_parse_from(["trainpool", "nodes"]).unwrap();
+        assert!(matches!(cli.command, Command::Nodes));
+    }
+
+    #[test]
+    fn legacy_run_remains_available() {
+        let cli = Cli::try_parse_from(["trainpool", "run", "--", "python", "train.py"]).unwrap();
+        assert!(matches!(cli.command, Command::Run { .. }));
+    }
 }
