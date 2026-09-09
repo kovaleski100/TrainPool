@@ -359,7 +359,8 @@ def test_ordinary_segmentation_scripts_via_launcher(segmentation_cluster, tmp_pa
         env=environment,
         capture_output=True,
         text=True,
-        timeout=300,
+        # Include checkpoint serialization and fabric cleanup on shared CI CPUs.
+        timeout=600,
     )
     assert result.returncode == 0, result.stderr
     assert "compatibility=FULL" in result.stderr
@@ -369,7 +370,11 @@ def test_ordinary_segmentation_scripts_via_launcher(segmentation_cluster, tmp_pa
     # extremely sensitive to float32 backend/gradient accumulation order.
     # Strict all-gradient/state parity is separately checked in float64.
     torch.testing.assert_close(
-        torch.tensor(actual["loss"]), torch.tensor(expected["loss"]), rtol=0.002, atol=0.002
+        torch.tensor(actual["loss"]),
+        torch.tensor(expected["loss"]),
+        rtol=0.002,
+        atol=0.002,
+        msg=f"{script}: baseline losses {expected['loss']}; TrainPool losses {actual['loss']}",
     )
     if script == "unet_train.py":
         expected_state = torch.load(tmp_path / "baseline.pt", weights_only=True)["model"]

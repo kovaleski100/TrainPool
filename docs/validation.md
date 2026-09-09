@@ -54,6 +54,13 @@ CPU CI unless an explicit CUDA fabric endpoint is supplied.
 
 CI also checks Ruff formatting/linting of `tests/models` and installs CPU torchvision
 so the real DeepLab path runs rather than being silently skipped.
+Python fabric/launcher integration in CI uses the release binary built earlier in
+the same job (`TRAINPOOL_BINARY=target/release/trainpool`). Rust unit and integration
+tests still run through `cargo test`. The debug-daemon DeepLab run exceeded its
+300-second process deadline on the hosted runner after emitting both training losses;
+the release selection tests the binary shipped to users with the same assertions.
+The segmentation process deadline is 600 seconds to include checkpoint serialization
+and RAM-fabric cleanup on shared CI CPUs; numerical tolerances are unchanged.
 
 Rust coverage includes deterministic largest-GPU selection for both automatic and
 explicit plans, ties, inventory versus executable capacity, CPU-only leaders,
