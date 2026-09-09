@@ -79,7 +79,8 @@ Python coverage includes:
 - Two-iteration float32 zero-TrainPool-import U-Net and DeepLab scripts launched
   through `trainpool python ...` against two daemons. Tests require actual remote
   read/write counters. Float32 loss tolerance is `rtol=2e-3, atol=2e-3`, accounting
-  for residual/BatchNorm accumulation order. U-Net checkpoint state is compared too.
+  for residual/BatchNorm accumulation order. DeepLab uses four 32x32 images;
+  U-Net uses two 16x16 images. U-Net checkpoint state is compared too.
 - Structured inputs/outputs, unused output branches, immutable buffer dependencies,
   fan-out accumulation, metadata-based group splitting and impossible-group failure.
 - Early rejection of shared/uncaptured buffers, complex training state and custom
@@ -95,6 +96,15 @@ Python coverage includes:
 This is useful stress coverage, not certification for unlimited duration or arbitrary
 network failures. Single-copy RAM loss explicitly fails the job; there is no automatic
 recovery. Longer real-network soak runs remain part of physical validation.
+
+The first hosted CI run exposed unstable float32 loss comparison for DeepLab with
+only two 16x16 images: both steps completed, but the second loss differed by 0.00675.
+The launcher test now uses the same four-image, 32x32 configuration as the strict
+float64 comparisons, while retaining its original loss tolerance. A local diagnostic
+found an initial stem-gradient peak of 263.65 with the tiny batch versus 3.84 with
+the larger one; first-forward losses matched exactly in both cases. These observations
+support sensitivity to rounding amplified through BatchNorm and AdamW, rather than
+establishing general float32 parity. The broader numerical limitation remains explicit.
 
 ## Physical CUDA checks on a local fabric
 

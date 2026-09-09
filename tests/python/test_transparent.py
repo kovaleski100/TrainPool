@@ -325,7 +325,9 @@ def test_ordinary_segmentation_scripts_via_launcher(segmentation_cluster, tmp_pa
         sys.executable,
         str(root / "tests/models" / script),
         "--size",
-        "16",
+        "32" if script == "deeplab_train.py" else "16",
+        "--batch",
+        "4" if script == "deeplab_train.py" else "2",
         "--steps",
         "2",
         "--width",
@@ -363,7 +365,9 @@ def test_ordinary_segmentation_scripts_via_launcher(segmentation_cluster, tmp_pa
     assert "compatibility=FULL" in result.stderr
     expected, actual = json.loads(baseline.stdout), json.loads(result.stdout)
     assert len(actual["loss"]) == 2
-    # Float32 residual/BN accumulation can diverge more than reduced float64 CI.
+    # DeepLab uses four 32x32 images: two 16x16 samples leave ASPP BatchNorm
+    # extremely sensitive to float32 backend/gradient accumulation order.
+    # Strict all-gradient/state parity is separately checked in float64.
     torch.testing.assert_close(
         torch.tensor(actual["loss"]), torch.tensor(expected["loss"]), rtol=0.002, atol=0.002
     )
