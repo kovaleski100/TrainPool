@@ -15,19 +15,25 @@ Tensor files, disk spill and TrainPool-managed swap are absent from the implemen
   7-second failure detection and deterministic leader election by physical RAM + VRAM.
 * Safe RAM budgets, atomic ownership accounting, bounded SDK/relay staging, RAM blocks,
   BLAKE3 checksums, chunked transfers, lease renewal/free and direct node-to-node migration.
-* CPU-only RAM providers, a single-GPU training plan, explicit heterogeneous stage
-  planning, topology estimates and on-demand directed bandwidth measurements.
+* CPU-only RAM providers, deterministic single-GPU compute placement, topology
+  estimates and on-demand directed bandwidth measurements.
 * Transparent PyTorch activation through `trainpool python ...`, plus tensor
-  offload/restore, saved activation hooks and actual sequential training with remote
-  parameters, inputs, gradients and SGD/Adam/AdamW optimizer state.
+  offload/restore, saved activation hooks and DAG training with RAM-backed
+  parameters, live skip tensors, gradients, buffers and SGD/Adam/AdamW optimizer state.
 * One-stage look-ahead prefetch, structured logs, per-job counters and repeatable tests.
 
-**Scope:** transparent FULL mode supports the subset of nonempty `nn.Sequential`
-models accepted by the existing pure-stage capacity runtime, with one fresh
-SGD/Adam/AdamW parameter group. Arbitrary graphs and cross-host multi-GPU execution
-remain future work. With several discovered GPUs and no explicit stage assignments,
-TrainPool deterministically selects the largest usable GPU for this job; it does not
-claim the other GPUs' VRAM as active capacity. CPU execution is test-only.
+**Status: progress toward v1, not a v1 release.** Transparent graph execution supports
+U-Net and torchvision DeepLabV3/ResNet50, with skip/residual branches, concatenation,
+BatchNorm, interpolation and structured outputs. CPU numerical and local TCP tests
+exercise these paths. Physical RTX 3050 tests include U-Net numerical parity,
+DeepLab execution, and a real U-Net baseline OOM overcome using a local multiprocess
+RAM fabric. Separate-machine RAM and longer hardware soak tests remain release
+gates; see [validation](docs/validation.md).
+
+Exactly **one GPU** computes: largest eligible `usable_vram`, with GPU UUID then node
+UUID breaking ties. Every explicit group assignment uses it too. Other GPUs remain
+inventory. Leadership is independent and may belong to a CPU-only RAM provider.
+No multi-GPU execution or implicit CPU fallback is implemented.
 
 ## Build
 
@@ -84,6 +90,42 @@ exits. Existing environment settings, including virtualenv/Conda selection and
 
 The legacy `trainpool run -- python train.py` spelling remains an alias.
 
+A normal `train.py` can use the standard torchvision API:
+
+```python
+import torch
+from torchvision.models.segmentation import deeplabv3_resnet50
+
+model = deeplabv3_resnet50(weights=None, weights_backbone=None, aux_loss=False)
+model = model.to("cuda")
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+for _ in range(3):
+    images = torch.randn(2, 3, 128, 128, device="cuda")
+    masks = torch.randint(21, (2, 128, 128), device="cuda")
+    optimizer.zero_grad()
+    outputs = model(images)
+    loss = torch.nn.functional.cross_entropy(outputs["out"], masks)
+    loss.backward()
+    optimizer.step()
+torch.save(model.state_dict(), "model.pt")  # explicit user checkpoint
+```
+
+The runnable [U-Net](tests/models/unet_train.py) and
+[DeepLab](tests/models/deeplab_train.py) acceptance scripts have no TrainPool imports.
+Run `trainpool python tests/models/unet_train.py` or
+`trainpool python tests/models/deeplab_train.py`. The initial model must fit host RAM,
+and every individual CUDA operator plus its active working set must fit the primary
+GPU. Graphs that cannot be captured or admitted fail explicitly.
+
+### Capacity reporting
+
+`cluster_physical_vram` and `cluster_usable_vram` describe inventory. For a new job,
+`current_job_backing_capacity = primary_gpu_usable_vram + pool_ram_budget`;
+`current_job_remaining_capacity = primary_gpu_usable_vram + pool_ram_allocatable`.
+`pool_ram_owned` is already part of the budget; it is never added a second time.
+These are logical **training-state** capacities, not a single CUDA allocation.
+Other jobs, staging and changing host pressure can reduce available capacity.
+
 ### Cluster inspection
 
 Default ports: TCP 7432 for framed control/data connections, UDP multicast
@@ -136,14 +178,10 @@ trainpool daemon --ram-limit-mib 1024
 trainpool python train.py
 ```
 
-The default model has more than 64 MiB of parameters and uses a configured 64 MiB
-stage admission budget. AdamW state and saved activations are also backed by RAM.
-The script checks that bytes actually traveled to and from remote RAM. Scale `--layers`
-until full-model state exceeds physical GPU capacity for a real hardware experiment;
-each individual stage, its recomputation and optimizer working set must still fit.
-The configured budget is an admission estimate, **not a CUDA allocator hard limit**.
-Physical-OOM comparisons require running the baseline and measuring both processes
-on the target GPU; the CPU simulation does not establish that result.
+For a real capacity experiment, use a segmentation model and the reproducible
+[hardware workflow](docs/validation.md#physical-hardware-workflow). It runs the same
+source, model, optimizer and GPU in both processes and requires an actual baseline
+CUDA allocation failure. A configured residency budget is not physical OOM evidence.
 
 ## Advanced Python API
 
@@ -183,11 +221,14 @@ only the SDK dependencies, not torch:
 
 ```sh
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+cargo build --locked --release
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 pip install -e './python[test]'
 pytest -q
-ruff check python tests/python examples scripts
+ruff check python tests/python tests/models examples scripts
+ruff format --check python tests/python tests/models examples scripts
 python scripts/two_node_demo.py
 ```
 
@@ -263,7 +304,8 @@ should configure enough seeds for a complete membership view.
 
 This is single-copy, in-memory research software. Node loss can lose data and fails
 affected jobs; leader changes invalidate existing plans. There is no consensus,
-replication, checkpointing, arbitrary graph partitioning or automatic remote execution.
+replication, automatic checkpoint recovery, arbitrary Python control-flow capture or
+automatic remote execution. Explicit model and optimizer checkpoint save/load are supported.
 The original model must initially fit in the script's host RAM, and each compute stage
 must fit its GPU. OS-managed paging is outside TrainPool's control; TrainPool creates
 no payload files or swap. See the linked documents for precise accounting limits.

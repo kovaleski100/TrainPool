@@ -7,6 +7,7 @@ No arbitrary graph interception, remote Python workers, or CPU CUDA fallback.
 from __future__ import annotations
 
 import contextlib
+import copy
 import types
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -304,7 +305,9 @@ class CapacityOptimizer:
                         parameter.grad = model.store.restore(record.gradients[name], device=model.device)
                     state = record.optimizer_state.get(name, {})
                     optimizer.state[parameter] = {
-                        key: model.store.restore(value) if isinstance(value, TensorHandle) else value
+                        key: model.store.restore(value, device="cpu" if key == "step" else model.device)
+                        if isinstance(value, TensorHandle)
+                        else value
                         for key, value in state.items()
                     }
                 optimizer.step()
@@ -337,6 +340,11 @@ class CapacityOptimizer:
             model.pending = False
             model.backward_complete = False
             model.store.flush_metrics()
+        except torch.OutOfMemoryError as error:
+            model.failed = True
+            raise TrainPoolError(
+                "TRAINPOOL_UNSUPPORTED_WORKING_SET: CUDA allocation during optimizer.step"
+            ) from error
         except BaseException:
             model.failed = True
             raise
@@ -373,8 +381,7 @@ def _validate_model(model):
             raise ValueError("Mutable/stateful buffers are unsupported; use pure stages")
         if not getattr(block, "_trainpool_explicit_stage", False):
             if any(
-                type(module) not in allowed or getattr(module, "inplace", False)
-                for module in block.modules()
+                type(module) not in allowed or getattr(module, "inplace", False) for module in block.modules()
             ):
                 raise ValueError("Unknown stage: annotate a pure block with trainpool_torch.stage()")
     return all_parameters
@@ -423,8 +430,7 @@ def build_sequential_runtime(
     for block in model:
         named = dict(block.named_parameters())
         weights = {
-            name: store.offload(parameter, expected_next_use="forward")
-            for name, parameter in named.items()
+            name: store.offload(parameter, expected_next_use="forward") for name, parameter in named.items()
         }
         trainable = {name for name, parameter in named.items() if parameter.requires_grad}
         block.to("meta")
@@ -452,9 +458,7 @@ def prepare_model_inplace(
 
     def transparent_forward(owner, value, *args, **kwargs):
         if args or kwargs:
-            raise TrainPoolError(
-                "TRAINPOOL_UNSUPPORTED_GRAPH: FULL sequential mode accepts one tensor input"
-            )
+            raise TrainPoolError("TRAINPOOL_UNSUPPORTED_GRAPH: FULL sequential mode accepts one tensor input")
         return runtime.forward(value, training=owner.training)
 
     def transparent_state_dict(owner, destination=None, prefix="", keep_vars=False):
@@ -510,25 +514,88 @@ def attach_optimizer_inplace(optimizer, runtime):
                 next_index += 1
             groups.append(encoded)
         state = {}
-        index = 0
-        for record in runtime.stages:
-            for name in record.weights:
-                values = record.optimizer_state.get(name)
-                if values:
-                    state[index] = {
-                        key: runtime.store.restore(value, device="cpu")
-                        if isinstance(value, TensorHandle)
-                        else value
-                        for key, value in values.items()
-                    }
-                index += 1
+        for index, (record, name) in enumerate(parameter_entries()):
+            values = record.optimizer_state.get(name)
+            if values:
+                state[index] = {
+                    key: runtime.store.restore(value, device="cpu")
+                    if isinstance(value, TensorHandle)
+                    else value
+                    for key, value in values.items()
+                }
         return {"state": state, "param_groups": groups}
 
-    def unsupported_load_state_dict(owner, *args, **kwargs):
-        del owner, args, kwargs
-        raise TrainPoolError(
-            "TRAINPOOL_CHECKPOINT_UNSUPPORTED: optimizer.load_state_dict is not yet safe in FULL mode"
-        )
+    def parameter_entries():
+        if hasattr(runtime, "parameter_order"):
+            return [(runtime.records[name], name) for name in runtime.parameter_order]
+        return [(record, name) for record in runtime.stages for name in record.weights]
+
+    def load_state_dict(owner, checkpoint):
+        if runtime.pending:
+            raise TrainPoolError("TRAINPOOL_CHECKPOINT_UNSUPPORTED: pending training step")
+        entries = parameter_entries()
+        groups = checkpoint.get("param_groups", [])
+        if len(groups) != 1 or len(groups[0].get("params", [])) != len(entries):
+            raise TrainPoolError("TRAINPOOL_UNSUPPORTED_OPTIMIZER: checkpoint parameter groups")
+        indices = groups[0]["params"]
+        if len(set(indices)) != len(indices) or set(checkpoint["state"]) - set(indices):
+            raise TrainPoolError("TRAINPOOL_CHECKPOINT_UNSUPPORTED: invalid parameter indices")
+        options = {key: copy.deepcopy(value) for key, value in groups[0].items() if key != "params"}
+        guard = getattr(runtime, "instrumentation_guard", contextlib.nullcontext)
+        with guard():
+            check = type(owner)(
+                [nn.Parameter(torch.empty((), device="cpu"))],
+                **{
+                    key: value
+                    for key, value in options.items()
+                    if key not in ("initial_lr", "decoupled_weight_decay")
+                },
+            )
+        _optimizer_options(check)
+        staged = []
+        try:
+            for index, (record, name) in zip(indices, entries, strict=True):
+                values = checkpoint["state"].get(index, {})
+                allowed = (
+                    {"momentum_buffer"}
+                    if type(owner) is torch.optim.SGD
+                    else {"step", "exp_avg", "exp_avg_sq", "max_exp_avg_sq"}
+                )
+                required = set() if type(owner) is torch.optim.SGD else {"step", "exp_avg", "exp_avg_sq"}
+                if values and (set(values) - allowed or required - set(values)):
+                    raise TrainPoolError(f"TRAINPOOL_CHECKPOINT_UNSUPPORTED: optimizer state for {name}")
+                uploaded = {}
+                staged.append((record, name, uploaded))
+                for key, value in values.items():
+                    if not isinstance(value, torch.Tensor):
+                        if key != "step" or type(value) not in (int, float):
+                            raise TrainPoolError(f"TRAINPOOL_CHECKPOINT_UNSUPPORTED: {name}.{key}")
+                        value = torch.tensor(float(value))
+                    if (key == "step" and value.numel() != 1) or (
+                        key != "step" and tuple(value.shape) != record.weights[name].shape
+                    ):
+                        raise TrainPoolError(f"TRAINPOOL_CHECKPOINT_UNSUPPORTED: shape of {name}.{key}")
+                    value = value.to(
+                        device="cpu",
+                        dtype=value.dtype if key == "step" else getattr(torch, record.weights[name].dtype),
+                    )
+                    uploaded[key] = runtime.store.offload(value, expected_next_use="optimizer.step")
+        except BaseException:
+            for _, _, state in staged:
+                for value in state.values():
+                    runtime.store.free(value)
+            raise
+        try:
+            for record, name, state in staged:
+                for value in record.optimizer_state.get(name, {}).values():
+                    if isinstance(value, TensorHandle):
+                        runtime.store.free(value)
+                record.optimizer_state[name] = state
+            owner.param_groups[0].update(options)
+            delegate.options = _optimizer_options(owner)
+        except BaseException:
+            runtime.failed = True
+            raise
 
     object.__setattr__(optimizer, "_trainpool_delegate", delegate)
     object.__setattr__(optimizer, "zero_grad", types.MethodType(zero_grad, optimizer))
@@ -537,7 +604,7 @@ def attach_optimizer_inplace(optimizer, runtime):
     object.__setattr__(
         optimizer,
         "load_state_dict",
-        types.MethodType(unsupported_load_state_dict, optimizer),
+        types.MethodType(load_state_dict, optimizer),
     )
     return optimizer
 
@@ -576,8 +643,14 @@ def prepare(
             if own_store:
                 store.close()
             raise TrainPoolError(
-                "Single-GPU SDK must run on the elected GPU compute node; heterogeneous execution is planning-only"
+                "TRAINPOOL_NO_CUDA: single-GPU SDK must run on the selected primary GPU node"
             )
+        try:
+            store._require_cuda(target)
+        except BaseException:
+            if own_store:
+                store.close()
+            raise
         if gpu_budget_bytes is None:
             gpu_budget_bytes = store.plan["gpu_assignments"][0]["usable_bytes"]
     try:

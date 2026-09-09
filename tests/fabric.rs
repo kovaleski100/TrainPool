@@ -305,3 +305,134 @@ async fn checksum_failure_does_not_commit_and_frame_limits_are_enforced() {
     assert!(wrong.connect(address).await.is_err());
     task.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupted_upload_cannot_commit_and_job_failure_is_explicit() {
+    let (r, task) = start().await;
+    let address = r.local().await.network.control_address;
+    let plan: TrainingPlan = r
+        .transport
+        .control(address, &Request::Plan { stages: vec![] })
+        .await
+        .unwrap()
+        .into_data()
+        .unwrap();
+    let handle: MemoryBlockHandle = r
+        .transport
+        .control(
+            address,
+            &Request::Allocate {
+                size: 4096,
+                job_id: plan.job_id,
+                compute_node: r.node_id,
+                preferred_node: None,
+                tensor: None,
+            },
+        )
+        .await
+        .unwrap()
+        .into_data()
+        .unwrap();
+    let payload = vec![19; 4096];
+    let checksum = blake3::hash(&payload).to_hex().to_string();
+    let mut stream = r.transport.connect(address).await.unwrap();
+    write_frame(
+        &mut stream,
+        &Request::WriteChunk {
+            handle: handle.clone(),
+            transfer_id: Uuid::new_v4(),
+            offset: 0,
+            length: 4096,
+            total_size: 4096,
+            checksum: checksum.clone(),
+            direct: true,
+        },
+    )
+    .await
+    .unwrap();
+    read_frame::<Response>(&mut stream)
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    stream.write_all(&payload[..128]).await.unwrap();
+    drop(stream);
+    let result = r
+        .transport
+        .control(
+            address,
+            &Request::Commit {
+                handle: handle.clone(),
+                checksum: checksum.clone(),
+                direct: true,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!result.ok, "partial transfer must never become visible");
+    assert!(
+        read_chunk(&r.transport, address, &handle, 0, 4096)
+            .await
+            .is_err()
+    );
+    // A complete retransmission can safely overwrite an uncommitted partial chunk.
+    write_chunk(&r.transport, address, &handle, Uuid::new_v4(), 0, &payload)
+        .await
+        .unwrap();
+    let committed: MemoryBlockHandle = r
+        .transport
+        .control(
+            address,
+            &Request::Commit {
+                handle,
+                checksum,
+                direct: true,
+            },
+        )
+        .await
+        .unwrap()
+        .into_data()
+        .unwrap();
+    assert_eq!(
+        read_chunk(&r.transport, address, &committed, 0, 4096)
+            .await
+            .unwrap(),
+        payload
+    );
+    r.jobs.lock().await.fail(
+        plan.job_id,
+        "TRAINPOOL_DATA_LOST: injected stress fault".into(),
+    );
+    let failed = r
+        .transport
+        .control(
+            address,
+            &Request::JobStatus {
+                job_id: plan.job_id,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!failed.ok);
+    assert!(failed.error.unwrap().contains("TRAINPOOL_DATA_LOST"));
+    let allocation = r
+        .transport
+        .control(
+            address,
+            &Request::Allocate {
+                size: 1,
+                job_id: plan.job_id,
+                compute_node: r.node_id,
+                preferred_node: None,
+                tensor: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!allocation.ok);
+    r.ram
+        .free(committed.id, committed.lease_token)
+        .await
+        .unwrap();
+    task.abort();
+}

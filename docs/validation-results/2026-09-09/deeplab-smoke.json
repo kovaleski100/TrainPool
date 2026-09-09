@@ -1,0 +1,703 @@
+{
+  "kind": "real CUDA / local multiprocess fabric",
+  "physical_host_verification": "operator must attest separate machines",
+  "status_before": {
+    "chunk_bytes": 4194304,
+    "leadership": {
+      "election_score": 20829200384,
+      "leader_epoch": "6fdc36bb-cf00-43a2-ba1b-4cadb8906773",
+      "leader_id": "3096ca5a-ff51-4036-a5ea-c8b504eb23bb"
+    },
+    "lease_seconds": 300,
+    "local_node": "3096ca5a-ff51-4036-a5ea-c8b504eb23bb",
+    "logical_memory": {
+      "allocated_ram": 0,
+      "allocated_vram": 719360,
+      "cluster_physical_vram": 4294967296,
+      "cluster_usable_vram": 3399483392,
+      "current_job_backing_capacity": 7698644992,
+      "current_job_remaining_capacity": 7698644992,
+      "disk_spill": false,
+      "free_vram": 3936354304,
+      "logical_training_capacity": 7698644992,
+      "physical_ram": 33068466176,
+      "physical_vram": 4294967296,
+      "pool_ram_allocatable": 4299161600,
+      "pool_ram_budget": 4299161600,
+      "pool_ram_owned": 0,
+      "primary_gpu_physical_vram": 4294967296,
+      "primary_gpu_usable_vram": 3399483392,
+      "usable_vram": 3399483392
+    },
+    "nodes": [
+      {
+        "architecture": "x86_64",
+        "cpu": {
+          "architecture": "x86_64",
+          "logical_cores": 16,
+          "model": "11th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz",
+          "physical_cores": 8
+        },
+        "gpus": [
+          {
+            "cuda_capability": "8.6",
+            "driver_version": "580.95.05",
+            "model": "NVIDIA GeForce RTX 3050 Laptop GPU",
+            "temperature": 50.0,
+            "trainpool_allocated_vram": 719360,
+            "usable_vram": 3399483392,
+            "utilization": 0.0,
+            "uuid": "GPU-445eafff-c52f-5df3-8929-9db21cfd6817",
+            "vram_free": 3936354304,
+            "vram_total": 4294967296,
+            "vram_used": 15728640
+          }
+        ],
+        "hostname": "kovaleski100-Nitro-AN515-57",
+        "incarnation": "522e3270-49a7-4af2-8be3-342b05d64939",
+        "leader_generation": "6fdc36bb-cf00-43a2-ba1b-4cadb8906773",
+        "memory": {
+          "os_available_ram": 10246836224,
+          "physical_ram_total": 16534233088,
+          "trainpool_ram_available": 4194304,
+          "trainpool_ram_budget": 4194304,
+          "trainpool_ram_used": 0
+        },
+        "network": {
+          "active_transfers": 0,
+          "chunk_bytes": 4194304,
+          "control_address": "127.0.0.1:17432",
+          "transport": "framed-tcp"
+        },
+        "node_id": "3096ca5a-ff51-4036-a5ea-c8b504eb23bb",
+        "os": "linux",
+        "runtime": {
+          "disk_spill": false,
+          "gpu_compute": true,
+          "ram_provider": true,
+          "version": "0.1.0"
+        }
+      },
+      {
+        "architecture": "x86_64",
+        "cpu": {
+          "architecture": "x86_64",
+          "logical_cores": 16,
+          "model": "11th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz",
+          "physical_cores": 8
+        },
+        "gpus": [],
+        "hostname": "kovaleski100-Nitro-AN515-57",
+        "incarnation": "8ff0ff20-0b26-4034-8635-0261e149cfc0",
+        "leader_generation": "411a9c1d-a68f-44b0-be1e-54591401f3fc",
+        "memory": {
+          "os_available_ram": 10308481024,
+          "physical_ram_total": 16534233088,
+          "trainpool_ram_available": 4294967296,
+          "trainpool_ram_budget": 4294967296,
+          "trainpool_ram_used": 0
+        },
+        "network": {
+          "active_transfers": 0,
+          "chunk_bytes": 4194304,
+          "control_address": "127.0.0.1:17434",
+          "transport": "framed-tcp"
+        },
+        "node_id": "c2fbad69-51de-4666-a0fc-91b7a50eb4aa",
+        "os": "linux",
+        "runtime": {
+          "disk_spill": false,
+          "gpu_compute": false,
+          "ram_provider": true,
+          "version": "0.1.0"
+        }
+      }
+    ],
+    "topology": {
+      "links": [
+        {
+          "active_transfers": 0,
+          "bytes_per_second": null,
+          "destination": "c2fbad69-51de-4666-a0fc-91b7a50eb4aa",
+          "latency_ms": 0.38697280644458765,
+          "sampled_at_ms": 1788969654973,
+          "source": "3096ca5a-ff51-4036-a5ea-c8b504eb23bb"
+        }
+      ]
+    }
+  },
+  "plan": {
+    "compute_nodes": [
+      "3096ca5a-ff51-4036-a5ea-c8b504eb23bb"
+    ],
+    "execution_supported": true,
+    "gpu_assignments": [
+      {
+        "capacity_share": 1.0,
+        "gpu_id": "GPU-445eafff-c52f-5df3-8929-9db21cfd6817",
+        "node_id": "3096ca5a-ff51-4036-a5ea-c8b504eb23bb",
+        "usable_bytes": 3399483392
+      }
+    ],
+    "job_id": "c250ed56-c4c0-4d22-b348-7baa9e974d3c",
+    "leader_epoch": "6fdc36bb-cf00-43a2-ba1b-4cadb8906773",
+    "leader_id": "3096ca5a-ff51-4036-a5ea-c8b504eb23bb",
+    "memory_budgets": {
+      "3096ca5a-ff51-4036-a5ea-c8b504eb23bb": 4194304,
+      "c2fbad69-51de-4666-a0fc-91b7a50eb4aa": 4294967296
+    },
+    "memory_nodes": [
+      "3096ca5a-ff51-4036-a5ea-c8b504eb23bb",
+      "c2fbad69-51de-4666-a0fc-91b7a50eb4aa"
+    ],
+    "stages": [],
+    "strategy": "SingleGpuDistributedMemory",
+    "tensor_placement_policy": "local-ram-then-transfer-cost",
+    "topology": {
+      "links": [
+        {
+          "active_transfers": 0,
+          "bytes_per_second": null,
+          "destination": "c2fbad69-51de-4666-a0fc-91b7a50eb4aa",
+          "latency_ms": 0.38697280644458765,
+          "sampled_at_ms": 1788969654973,
+          "source": "3096ca5a-ff51-4036-a5ea-c8b504eb23bb"
+        }
+      ]
+    }
+  },
+  "command": [
+    "/tmp/trainpool-cuda-venv/bin/python",
+    "/home/kovaleski100/\u00c1rea de trabalho/TrainPool/tests/models/deeplab_train.py",
+    "--device",
+    "cuda",
+    "--width",
+    "128",
+    "--size",
+    "32",
+    "--batch",
+    "2",
+    "--steps",
+    "2",
+    "--optimizer",
+    "AdamW"
+  ],
+  "source_sha256": {
+    "tests/models/unet_train.py": "6ee5b94a4946e9c4e881996413cfa30373ba3026b26408c03c8bb4c07f7b2e22",
+    "tests/models/deeplab_train.py": "6e2f917f0c3189bd2ae81cd9584da783f3e70cf99685f5bcc3565e8316bed847"
+  },
+  "gpu_uuid": "GPU-445eafff-c52f-5df3-8929-9db21cfd6817",
+  "cuda_visible_devices": "GPU-445eafff-c52f-5df3-8929-9db21cfd6817",
+  "torch_version": "2.14.0+cu130",
+  "topology": {
+    "links": [
+      {
+        "active_transfers": 0,
+        "bytes_per_second": 2149801443.5275307,
+        "destination": "c2fbad69-51de-4666-a0fc-91b7a50eb4aa",
+        "latency_ms": 0.30029014112508057,
+        "sampled_at_ms": 1788969655157,
+        "source": "3096ca5a-ff51-4036-a5ea-c8b504eb23bb"
+      },
+      {
+        "active_transfers": 0,
+        "bytes_per_second": 2386427254.1646724,
+        "destination": "3096ca5a-ff51-4036-a5ea-c8b504eb23bb",
+        "latency_ms": 0.117675,
+        "sampled_at_ms": 1788969655164,
+        "source": "c2fbad69-51de-4666-a0fc-91b7a50eb4aa"
+      }
+    ]
+  },
+  "metrics_before": {
+    "3096ca5a-ff51-4036-a5ea-c8b504eb23bb": {
+      "jobs": {
+        "5883548e-f211-404a-bb00-5f4b65608f52": {
+          "bytes_gpu_to_local_ram": 3116544,
+          "bytes_local_ram_to_gpu": 4871424,
+          "bytes_local_to_remote_ram": 3179464,
+          "bytes_remote_ram_to_local": 4996736,
+          "current_gpu_residency": 719360,
+          "current_ram_residency": 0,
+          "failed_transfers": 0,
+          "gpu_id": "GPU-445eafff-c52f-5df3-8929-9db21cfd6817",
+          "gpu_wait_for_data_ms": 689.6565979996012,
+          "migration_latency_ms": 0.0,
+          "network_bytes": 0,
+          "network_wait_ms": 34.00220899999994,
+          "peak_gpu_residency": 3601920,
+          "peak_ram_residency": 0,
+          "prefetch_hits": 0,
+          "prefetch_misses": 0,
+          "ram_pressure_events": 0,
+          "tensor_allocations": 0,
+          "tensor_migrations": 0
+        },
+        "86928fae-4b84-4f09-8f53-78fa1afac64e": {
+          "bytes_gpu_to_local_ram": 3116544,
+          "bytes_local_ram_to_gpu": 4871424,
+          "bytes_local_to_remote_ram": 3179464,
+          "bytes_remote_ram_to_local": 4996736,
+          "current_gpu_residency": 719360,
+          "current_ram_residency": 0,
+          "failed_transfers": 0,
+          "gpu_id": "GPU-445eafff-c52f-5df3-8929-9db21cfd6817",
+          "gpu_wait_for_data_ms": 696.7371949986045,
+          "migration_latency_ms": 0.0,
+          "network_bytes": 0,
+          "network_wait_ms": 34.341279,
+          "peak_gpu_residency": 3601920,
+          "peak_ram_residency": 0,
+          "prefetch_hits": 0,
+          "prefetch_misses": 0,
+          "ram_pressure_events": 0,
+          "tensor_allocations": 0,
+          "tensor_migrations": 0
+        },
+        "a0da9d30-3ce7-4a7e-8c1f-a52279f28a52": {
+          "bytes_gpu_to_local_ram": 2871712,
+          "bytes_local_ram_to_gpu": 4749008,
+          "bytes_local_to_remote_ram": 2934280,
+          "bytes_remote_ram_to_local": 4874144,
+          "current_gpu_residency": 564736,
+          "current_ram_residency": 0,
+          "failed_transfers": 0,
+          "gpu_id": "GPU-445eafff-c52f-5df3-8929-9db21cfd6817",
+          "gpu_wait_for_data_ms": 622.6194110222423,
+          "migration_latency_ms": 0.0,
+          "network_bytes": 0,
+          "network_wait_ms": 23.90333899999997,
+          "peak_gpu_residency": 3447296,
+          "peak_ram_residency": 0,
+          "prefetch_hits": 0,
+          "prefetch_misses": 0,
+          "ram_pressure_events": 0,
+          "tensor_allocations": 0,
+          "tensor_migrations": 0
+        }
+      },
+      "node_id": "3096ca5a-ff51-4036-a5ea-c8b504eb23bb",
+      "owned_ram": 0,
+      "peak_ram": 131072
+    },
+    "c2fbad69-51de-4666-a0fc-91b7a50eb4aa": {
+      "jobs": {
+        "5883548e-f211-404a-bb00-5f4b65608f52": {
+          "bytes_gpu_to_local_ram": 0,
+          "bytes_local_ram_to_gpu": 0,
+          "bytes_local_to_remote_ram": 0,
+          "bytes_remote_ram_to_local": 0,
+          "current_gpu_residency": 0,
+          "current_ram_residency": 0,
+          "failed_transfers": 0,
+          "gpu_id": null,
+          "gpu_wait_for_data_ms": 0.0,
+          "migration_latency_ms": 0.0,
+          "network_bytes": 8176200,
+          "network_wait_ms": 0.0,
+          "peak_gpu_residency": 0,
+          "peak_ram_residency": 907600,
+          "prefetch_hits": 0,
+          "prefetch_misses": 0,
+          "ram_pressure_events": 0,
+          "tensor_allocations": 660,
+          "tensor_migrations": 0
+        },
+        "86928fae-4b84-4f09-8f53-78fa1afac64e": {
+          "bytes_gpu_to_local_ram": 0,
+          "bytes_local_ram_to_gpu": 0,
+          "bytes_local_to_remote_ram": 0,
+          "bytes_remote_ram_to_local": 0,
+          "current_gpu_residency": 0,
+          "current_ram_residency": 0,
+          "failed_transfers": 0,
+          "gpu_id": null,
+          "gpu_wait_for_data_ms": 0.0,
+          "migration_latency_ms": 0.0,
+          "network_bytes": 8176200,
+          "network_wait_ms": 0.0,
+          "peak_gpu_residency": 0,
+          "peak_ram_residency": 907600,
+          "prefetch_hits": 0,
+          "prefetch_misses": 0,
+          "ram_pressure_events": 0,
+          "tensor_allocations": 660,
+          "tensor_migrations": 0
+        },
+        "a0da9d30-3ce7-4a7e-8c1f-a52279f28a52": {
+          "bytes_gpu_to_local_ram": 0,
+          "bytes_local_ram_to_gpu": 0,
+          "bytes_local_to_remote_ram": 0,
+          "bytes_remote_ram_to_local": 0,
+          "current_gpu_residency": 0,
+          "current_ram_residency": 0,
+          "failed_transfers": 0,
+          "gpu_id": null,
+          "gpu_wait_for_data_ms": 0.0,
+          "migration_latency_ms": 0.0,
+          "network_bytes": 7808424,
+          "network_wait_ms": 0.0,
+          "peak_gpu_residency": 0,
+          "peak_ram_residency": 785008,
+          "prefetch_hits": 0,
+          "prefetch_misses": 0,
+          "ram_pressure_events": 0,
+          "tensor_allocations": 396,
+          "tensor_migrations": 0
+        }
+      },
+      "node_id": "c2fbad69-51de-4666-a0fc-91b7a50eb4aa",
+      "owned_ram": 0,
+      "peak_ram": 907600
+    }
+  },
+  "release_gate_passed": false,
+  "nvidia_smi": "\n==============NVSMI LOG==============\n\nTimestamp                                 : Wed Sep  9 17:00:55 2026\nDriver Version                            : 580.95.05\nCUDA Version                              : 13.0\n\nAttached GPUs                             : 1\nGPU 00000000:01:00.0\n    Product Name                          : NVIDIA GeForce RTX 3050 Laptop GPU\n    Product Brand                         : GeForce\n    Product Architecture                  : Ampere\n    Display Mode                          : Requested functionality has been deprecated\n    Display Attached                      : No\n    Display Active                        : Disabled\n    Persistence Mode                      : Disabled\n    Addressing Mode                       : HMM\n    MIG Mode\n        Current                           : N/A\n        Pending                           : N/A\n    Accounting Mode                       : Disabled\n    Accounting Mode Buffer Size           : 4000\n    Driver Model\n        Current                           : N/A\n        Pending                           : N/A\n    Serial Number                         : N/A\n    GPU UUID                              : GPU-445eafff-c52f-5df3-8929-9db21cfd6817\n    GPU PDI                               : 0x56e581ac802734a3\n    Minor Number                          : 0\n    VBIOS Version                         : 94.07.3A.40.08\n    MultiGPU Board                        : No\n    Board ID                              : 0x100\n    Board Part Number                     : N/A\n    GPU Part Number                       : 25A2-725-A1\n    FRU Part Number                       : N/A\n    Platform Info\n        Chassis Serial Number             : N/A\n        Slot Number                       : N/A\n        Tray Index                        : N/A\n        Host ID                           : N/A\n        Peer Type                         : N/A\n        Module Id                         : 1\n        GPU Fabric GUID                   : N/A\n    Inforom Version\n        Image Version                     : G001.0000.03.03\n        OEM Object                        : 2.0\n        ECC Object                        : N/A\n        Power Management Object           : N/A\n    Inforom BBX Object Flush\n        Latest Timestamp                  : N/A\n        Latest Duration                   : N/A\n    GPU Operation Mode\n        Current                           : N/A\n        Pending                           : N/A\n    GPU C2C Mode                          : N/A\n    GPU Virtualization Mode\n        Virtualization Mode               : None\n        Host VGPU Mode                    : N/A\n        vGPU Heterogeneous Mode           : N/A\n    GPU Recovery Action                   : None\n    GSP Firmware Version                  : 580.95.05\n    IBMNPU\n        Relaxed Ordering Mode             : N/A\n    PCI\n        Bus                               : 0x01\n        Device                            : 0x00\n        Domain                            : 0x0000\n        Base Classcode                    : 0x3\n        Sub Classcode                     : 0x0\n        Device Id                         : 0x25A210DE\n        Bus Id                            : 00000000:01:00.0\n        Sub System Id                     : 0x153A1025\n        GPU Link Info\n            PCIe Generation\n                Max                       : 4\n                Current                   : 1\n                Device Current            : 1\n                Device Max                : 4\n                Host Max                  : 4\n            Link Width\n                Max                       : 16x\n                Current                   : 8x\n        Bridge Chip\n            Type                          : N/A\n            Firmware                      : N/A\n        Replays Since Reset               : 0\n        Replay Number Rollovers           : 0\n        Tx Throughput                     : 488 KB/s\n        Rx Throughput                     : 439 KB/s\n        Atomic Caps Outbound              : N/A\n        Atomic Caps Inbound               : N/A\n    Fan Speed                             : N/A\n    Performance State                     : P8\n    Clocks Event Reasons\n        Idle                              : Active\n        Applications Clocks Setting       : Not Active\n        SW Power Cap                      : Not Active\n        HW Slowdown                       : Not Active\n            HW Thermal Slowdown           : Not Active\n            HW Power Brake Slowdown       : Not Active\n        Sync Boost                        : Not Active\n        SW Thermal Slowdown               : Not Active\n        Display Clock Setting             : Not Active\n    Clocks Event Reasons Counters\n        SW Power Capping                  : 0 us\n        Sync Boost                        : 0 us\n        SW Thermal Slowdown               : 0 us\n        HW Thermal Slowdown               : 0 us\n        HW Power Braking                  : 0 us\n    Sparse Operation Mode                 : N/A\n    FB Memory Usage\n        Total                             : 4096 MiB\n        Reserved                          : 328 MiB\n        Used                              : 18 MiB\n        Free                              : 3752 MiB\n    BAR1 Memory Usage\n        Total                             : 4096 MiB\n        Used                              : 3 MiB\n        Free                              : 4093 MiB\n    Conf Compute Protected Memory Usage\n        Total                             : 0 MiB\n        Used                              : 0 MiB\n        Free                              : 0 MiB\n    Compute Mode                          : Default\n    Utilization\n        GPU                               : 0 %\n        Memory                            : 0 %\n        Encoder                           : 0 %\n        Decoder                           : 0 %\n        JPEG                              : 0 %\n        OFA                               : 0 %\n    Encoder Stats\n        Active Sessions                   : 0\n        Average FPS                       : 0\n        Average Latency                   : 0\n    FBC Stats\n        Active Sessions                   : 0\n        Average FPS                       : 0\n        Average Latency                   : 0\n    DRAM Encryption Mode\n        Current                           : N/A\n        Pending                           : N/A\n    ECC Mode\n        Current                           : N/A\n        Pending                           : N/A\n    ECC Errors\n        Volatile\n            SRAM Correctable              : N/A\n            SRAM Uncorrectable Parity     : N/A\n            SRAM Uncorrectable SEC-DED    : N/A\n            DRAM Correctable              : N/A\n            DRAM Uncorrectable            : N/A\n        Aggregate\n            SRAM Correctable              : N/A\n            SRAM Uncorrectable Parity     : N/A\n            SRAM Uncorrectable SEC-DED    : N/A\n            DRAM Correctable              : N/A\n            DRAM Uncorrectable            : N/A\n            SRAM Threshold Exceeded       : N/A\n        Aggregate Uncorrectable SRAM Sources\n            SRAM L2                       : N/A\n            SRAM SM                       : N/A\n            SRAM Microcontroller          : N/A\n            SRAM PCIE                     : N/A\n            SRAM Other                    : N/A\n        Channel Repair Pending            : No\n        TPC Repair Pending                : No\n    Retired Pages\n        Single Bit ECC                    : N/A\n        Double Bit ECC                    : N/A\n        Pending Page Blacklist            : N/A\n    Remapped Rows                         : N/A\n    Temperature\n        GPU Current Temp                  : 50 C\n        GPU T.Limit Temp                  : N/A\n        GPU Shutdown Temp                 : 100 C\n        GPU Slowdown Temp                 : 97 C\n        GPU Max Operating Temp            : 105 C\n        GPU Target Temperature            : 87 C\n        Memory Current Temp               : N/A\n        Memory Max Operating Temp         : N/A\n    GPU Power Readings\n        Average Power Draw                : 10.66 W\n        Instantaneous Power Draw          : 10.74 W\n        Current Power Limit               : 60.00 W\n        Requested Power Limit             : 60.00 W\n        Default Power Limit               : 60.00 W\n        Min Power Limit                   : 1.00 W\n        Max Power Limit                   : 75.00 W\n    GPU Memory Power Readings \n        Average Power Draw                : N/A\n        Instantaneous Power Draw          : N/A\n    Module Power Readings\n        Average Power Draw                : N/A\n        Instantaneous Power Draw          : N/A\n        Current Power Limit               : N/A\n        Requested Power Limit             : N/A\n        Default Power Limit               : N/A\n        Min Power Limit                   : N/A\n        Max Power Limit                   : N/A\n    Power Smoothing                       : N/A\n    Workload Power Profiles\n        Requested Profiles                : N/A\n        Enforced Profiles                 : N/A\n    Clocks\n        Graphics                          : 210 MHz\n        SM                                : 210 MHz\n        Memory                            : 405 MHz\n        Video                             : 555 MHz\n    Applications Clocks\n        Graphics                          : N/A\n        Memory                            : N/A\n    Default Applications Clocks\n        Graphics                          : N/A\n        Memory                            : N/A\n    Deferred Clocks\n        Memory                            : N/A\n    Max Clocks\n        Graphics                          : 2100 MHz\n        SM                                : 2100 MHz\n        Memory                            : 6001 MHz\n        Video                             : 1950 MHz\n    Max Customer Boost Clocks\n        Graphics                          : N/A\n    Clock Policy\n        Auto Boost                        : N/A\n        Auto Boost Default                : N/A\n    Fabric\n        State                             : N/A\n        Status                            : N/A\n        CliqueId                          : N/A\n        ClusterUUID                       : N/A\n        Health\n            Summary                       : N/A\n            Bandwidth                     : N/A\n            Route Recovery in progress    : N/A\n            Route Unhealthy               : N/A\n            Access Timeout Recovery       : N/A\n            Incorrect Configuration       : N/A\n    Processes\n        GPU instance ID                   : N/A\n        Compute instance ID               : N/A\n        Process ID                        : 1414\n            Type                          : G\n            Name                          : /usr/lib/xorg/Xorg\n            Used GPU Memory               : 4 MiB\n    Capabilities\n        EGM                               : disabled\n\n",
+  "baseline": {
+    "exit_code": 0,
+    "seconds": 3.9229133729995738,
+    "stdout": "{\"loss\": [1.162627935409546, 1.1599576473236084], \"step_seconds\": [0.32699497700014035, 0.03407846099980816], \"peak_cuda_allocated\": 681417216, \"peak_cuda_reserved\": 706740224, \"gpu\": \"NVIDIA GeForce RTX 3050 Laptop GPU\", \"gpu_vram\": 3951296512}\n",
+    "stderr": ""
+  },
+  "real_baseline_cuda_oom": false,
+  "trainpool": {
+    "exit_code": 0,
+    "seconds": 54.16598593700019,
+    "stdout": "{\"loss\": [1.162627935409546, 1.154945969581604], \"step_seconds\": [21.488579390000268, 26.270140609999544], \"peak_cuda_allocated\": 272730112, \"peak_cuda_reserved\": 310378496, \"gpu\": \"NVIDIA GeForce RTX 3050 Laptop GPU\", \"gpu_vram\": 3951296512}\n",
+    "stderr": "[TrainPool] compatibility=FULL backend=cuda parameters=remote activations=recomputed gradients=remote optimizer_state=remote\n"
+  },
+  "metrics_after": {
+    "3096ca5a-ff51-4036-a5ea-c8b504eb23bb": {
+      "jobs": {
+        "5883548e-f211-404a-bb00-5f4b65608f52": {
+          "bytes_gpu_to_local_ram": 3116544,
+          "bytes_local_ram_to_gpu": 4871424,
+          "bytes_local_to_remote_ram": 3179464,
+          "bytes_remote_ram_to_local": 4996736,
+          "current_gpu_residency": 719360,
+          "current_ram_residency": 0,
+          "failed_transfers": 0,
+          "gpu_id": "GPU-445eafff-c52f-5df3-8929-9db21cfd6817",
+          "gpu_wait_for_data_ms": 689.6565979996012,
+          "migration_latency_ms": 0.0,
+          "network_bytes": 0,
+          "network_wait_ms": 34.00220899999994,
+          "peak_gpu_residency": 3601920,
+          "peak_ram_residency": 0,
+          "prefetch_hits": 0,
+          "prefetch_misses": 0,
+          "ram_pressure_events": 0,
+          "tensor_allocations": 0,
+          "tensor_migrations": 0
+        },
+        "644da6f4-a18b-4ad0-aff4-35720eee9d1b": {
+          "bytes_gpu_to_local_ram": 1279625184,
+          "bytes_local_ram_to_gpu": 1603101112,
+          "bytes_local_to_remote_ram": 1426554140,
+          "bytes_remote_ram_to_local": 1580767276,
+          "current_gpu_residency": 0,
+          "current_ram_residency": 0,
+          "failed_transfers": 0,
+          "gpu_id": "GPU-445eafff-c52f-5df3-8929-9db21cfd6817",
+          "gpu_wait_for_data_ms": 22859.137170984468,
+          "migration_latency_ms": 0.0,
+          "network_bytes": 34171332,
+          "network_wait_ms": 2532.730873999998,
+          "peak_gpu_residency": 272730112,
+          "peak_ram_residency": 3932160,
+          "prefetch_hits": 0,
+          "prefetch_misses": 0,
+          "ram_pressure_events": 0,
+          "tensor_allocations": 1418,
+          "tensor_migrations": 0
+        },
+        "86928fae-4b84-4f09-8f53-78fa1afac64e": {
+          "bytes_gpu_to_local_ram": 3116544,
+          "bytes_local_ram_to_gpu": 4871424,
+          "bytes_local_to_remote_ram": 3179464,
+          "bytes_remote_ram_to_local": 4996736,
+          "current_gpu_residency": 719360,
+          "current_ram_residency": 0,
+          "failed_transfers": 0,
+          "gpu_id": "GPU-445eafff-c52f-5df3-8929-9db21cfd6817",
+          "gpu_wait_for_data_ms": 696.7371949986045,
+          "migration_latency_ms": 0.0,
+          "network_bytes": 0,
+          "network_wait_ms": 34.341279,
+          "peak_gpu_residency": 3601920,
+          "peak_ram_residency": 0,
+          "prefetch_hits": 0,
+          "prefetch_misses": 0,
+          "ram_pressure_events": 0,
+          "tensor_allocations": 0,
+          "tensor_migrations": 0
+        },
+        "a0da9d30-3ce7-4a7e-8c1f-a52279f28a52": {
+          "bytes_gpu_to_local_ram": 2871712,
+          "bytes_local_ram_to_gpu": 4749008,
+          "bytes_local_to_remote_ram": 2934280,
+          "bytes_remote_ram_to_local": 4874144,
+          "current_gpu_residency": 564736,
+          "current_ram_residency": 0,
+          "failed_transfers": 0,
+          "gpu_id": "GPU-445eafff-c52f-5df3-8929-9db21cfd6817",
+          "gpu_wait_for_data_ms": 622.6194110222423,
+          "migration_latency_ms": 0.0,
+          "network_bytes": 0,
+          "network_wait_ms": 23.90333899999997,
+          "peak_gpu_residency": 3447296,
+          "peak_ram_residency": 0,
+          "prefetch_hits": 0,
+          "prefetch_misses": 0,
+          "ram_pressure_events": 0,
+          "tensor_allocations": 0,
+          "tensor_migrations": 0
+        }
+      },
+      "node_id": "3096ca5a-ff51-4036-a5ea-c8b504eb23bb",
+      "owned_ram": 0,
+      "peak_ram": 4063232
+    },
+    "c2fbad69-51de-4666-a0fc-91b7a50eb4aa": {
+      "jobs": {
+        "5883548e-f211-404a-bb00-5f4b65608f52": {
+          "bytes_gpu_to_local_ram": 0,
+          "bytes_local_ram_to_gpu": 0,
+          "bytes_local_to_remote_ram": 0,
+          "bytes_remote_ram_to_local": 0,
+          "current_gpu_residency": 0,
+          "current_ram_residency": 0,
+          "failed_transfers": 0,
+          "gpu_id": null,
+          "gpu_wait_for_data_ms": 0.0,
+          "migration_latency_ms": 0.0,
+          "network_bytes": 8176200,
+          "network_wait_ms": 0.0,
+          "peak_gpu_residency": 0,
+          "peak_ram_residency": 907600,
+          "prefetch_hits": 0,
+          "prefetch_misses": 0,
+          "ram_pressure_events": 0,
+          "tensor_allocations": 660,
+          "tensor_migrations": 0
+        },
+        "644da6f4-a18b-4ad0-aff4-35720eee9d1b": {
+          "bytes_gpu_to_local_ram": 0,
+          "bytes_local_ram_to_gpu": 0,
+          "bytes_local_to_remote_ram": 0,
+          "bytes_remote_ram_to_local": 0,
+          "current_gpu_residency": 0,
+          "current_ram_residency": 0,
+          "failed_transfers": 0,
+          "gpu_id": null,
+          "gpu_wait_for_data_ms": 0.0,
+          "migration_latency_ms": 0.0,
+          "network_bytes": 3007321416,
+          "network_wait_ms": 0.0,
+          "peak_gpu_residency": 0,
+          "peak_ram_residency": 712597640,
+          "prefetch_hits": 0,
+          "prefetch_misses": 0,
+          "ram_pressure_events": 0,
+          "tensor_allocations": 1753,
+          "tensor_migrations": 0
+        },
+        "86928fae-4b84-4f09-8f53-78fa1afac64e": {
+          "bytes_gpu_to_local_ram": 0,
+          "bytes_local_ram_to_gpu": 0,
+          "bytes_local_to_remote_ram": 0,
+          "bytes_remote_ram_to_local": 0,
+          "current_gpu_residency": 0,
+          "current_ram_residency": 0,
+          "failed_transfers": 0,
+          "gpu_id": null,
+          "gpu_wait_for_data_ms": 0.0,
+          "migration_latency_ms": 0.0,
+          "network_bytes": 8176200,
+          "network_wait_ms": 0.0,
+          "peak_gpu_residency": 0,
+          "peak_ram_residency": 907600,
+          "prefetch_hits": 0,
+          "prefetch_misses": 0,
+          "ram_pressure_events": 0,
+          "tensor_allocations": 660,
+          "tensor_migrations": 0
+        },
+        "a0da9d30-3ce7-4a7e-8c1f-a52279f28a52": {
+          "bytes_gpu_to_local_ram": 0,
+          "bytes_local_ram_to_gpu": 0,
+          "bytes_local_to_remote_ram": 0,
+          "bytes_remote_ram_to_local": 0,
+          "current_gpu_residency": 0,
+          "current_ram_residency": 0,
+          "failed_transfers": 0,
+          "gpu_id": null,
+          "gpu_wait_for_data_ms": 0.0,
+          "migration_latency_ms": 0.0,
+          "network_bytes": 7808424,
+          "network_wait_ms": 0.0,
+          "peak_gpu_residency": 0,
+          "peak_ram_residency": 785008,
+          "prefetch_hits": 0,
+          "prefetch_misses": 0,
+          "ram_pressure_events": 0,
+          "tensor_allocations": 396,
+          "tensor_migrations": 0
+        }
+      },
+      "node_id": "c2fbad69-51de-4666-a0fc-91b7a50eb4aa",
+      "owned_ram": 0,
+      "peak_ram": 712597640
+    }
+  },
+  "status_after": {
+    "chunk_bytes": 4194304,
+    "leadership": {
+      "election_score": 20829200384,
+      "leader_epoch": "6fdc36bb-cf00-43a2-ba1b-4cadb8906773",
+      "leader_id": "3096ca5a-ff51-4036-a5ea-c8b504eb23bb"
+    },
+    "lease_seconds": 300,
+    "local_node": "3096ca5a-ff51-4036-a5ea-c8b504eb23bb",
+    "logical_memory": {
+      "allocated_ram": 201939968,
+      "allocated_vram": 0,
+      "cluster_physical_vram": 4294967296,
+      "cluster_usable_vram": 2989490176,
+      "current_job_backing_capacity": 7288651776,
+      "current_job_remaining_capacity": 7086711808,
+      "disk_spill": false,
+      "free_vram": 3526361088,
+      "logical_training_capacity": 7086711808,
+      "physical_ram": 33068466176,
+      "physical_vram": 4294967296,
+      "pool_ram_allocatable": 4097221632,
+      "pool_ram_budget": 4299161600,
+      "pool_ram_owned": 201939968,
+      "primary_gpu_physical_vram": 4294967296,
+      "primary_gpu_usable_vram": 2989490176,
+      "usable_vram": 2989490176
+    },
+    "nodes": [
+      {
+        "architecture": "x86_64",
+        "cpu": {
+          "architecture": "x86_64",
+          "logical_cores": 16,
+          "model": "11th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz",
+          "physical_cores": 8
+        },
+        "gpus": [
+          {
+            "cuda_capability": "8.6",
+            "driver_version": "580.95.05",
+            "model": "NVIDIA GeForce RTX 3050 Laptop GPU",
+            "temperature": 56.0,
+            "trainpool_allocated_vram": 0,
+            "usable_vram": 2989490176,
+            "utilization": 1.0,
+            "uuid": "GPU-445eafff-c52f-5df3-8929-9db21cfd6817",
+            "vram_free": 3526361088,
+            "vram_total": 4294967296,
+            "vram_used": 426770432
+          }
+        ],
+        "hostname": "kovaleski100-Nitro-AN515-57",
+        "incarnation": "522e3270-49a7-4af2-8be3-342b05d64939",
+        "leader_generation": "6fdc36bb-cf00-43a2-ba1b-4cadb8906773",
+        "memory": {
+          "os_available_ram": 9680060416,
+          "physical_ram_total": 16534233088,
+          "trainpool_ram_available": 4194304,
+          "trainpool_ram_budget": 4194304,
+          "trainpool_ram_used": 0
+        },
+        "network": {
+          "active_transfers": 0,
+          "chunk_bytes": 4194304,
+          "control_address": "127.0.0.1:17432",
+          "transport": "framed-tcp"
+        },
+        "node_id": "3096ca5a-ff51-4036-a5ea-c8b504eb23bb",
+        "os": "linux",
+        "runtime": {
+          "disk_spill": false,
+          "gpu_compute": true,
+          "ram_provider": true,
+          "version": "0.1.0"
+        }
+      },
+      {
+        "architecture": "x86_64",
+        "cpu": {
+          "architecture": "x86_64",
+          "logical_cores": 16,
+          "model": "11th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz",
+          "physical_cores": 8
+        },
+        "gpus": [],
+        "hostname": "kovaleski100-Nitro-AN515-57",
+        "incarnation": "8ff0ff20-0b26-4034-8635-0261e149cfc0",
+        "leader_generation": "411a9c1d-a68f-44b0-be1e-54591401f3fc",
+        "memory": {
+          "os_available_ram": 8456019968,
+          "physical_ram_total": 16534233088,
+          "trainpool_ram_available": 4093027328,
+          "trainpool_ram_budget": 4294967296,
+          "trainpool_ram_used": 201939968
+        },
+        "network": {
+          "active_transfers": 0,
+          "chunk_bytes": 4194304,
+          "control_address": "127.0.0.1:17434",
+          "transport": "framed-tcp"
+        },
+        "node_id": "c2fbad69-51de-4666-a0fc-91b7a50eb4aa",
+        "os": "linux",
+        "runtime": {
+          "disk_spill": false,
+          "gpu_compute": false,
+          "ram_provider": true,
+          "version": "0.1.0"
+        }
+      }
+    ],
+    "topology": {
+      "links": [
+        {
+          "active_transfers": 0,
+          "bytes_per_second": 2149801443.5275307,
+          "destination": "c2fbad69-51de-4666-a0fc-91b7a50eb4aa",
+          "latency_ms": 5.741757636323961,
+          "sampled_at_ms": 1788969724973,
+          "source": "3096ca5a-ff51-4036-a5ea-c8b504eb23bb"
+        },
+        {
+          "active_transfers": 0,
+          "bytes_per_second": 2386427254.1646724,
+          "destination": "3096ca5a-ff51-4036-a5ea-c8b504eb23bb",
+          "latency_ms": 0.117675,
+          "sampled_at_ms": 1788969655164,
+          "source": "c2fbad69-51de-4666-a0fc-91b7a50eb4aa"
+        }
+      ]
+    }
+  },
+  "remote_bytes_read": 1580767276,
+  "remote_bytes_written": 1426554140,
+  "measurements": {
+    "loss": [
+      1.162627935409546,
+      1.154945969581604
+    ],
+    "step_seconds": [
+      21.488579390000268,
+      26.270140609999544
+    ],
+    "peak_cuda_allocated": 272730112,
+    "peak_cuda_reserved": 310378496,
+    "gpu": "NVIDIA GeForce RTX 3050 Laptop GPU",
+    "gpu_vram": 3951296512
+  },
+  "cuda_experiment_passed": true
+}

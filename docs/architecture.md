@@ -31,7 +31,7 @@ intermediate hop solely because it is leader.
   capacity-aware stage assignments.
 * `runtime`: dispatch, membership exchange, pressure handling and services sharing one
   process. No remote execution endpoint exists.
-* `python/trainpool_torch`: local SDK, tensor table, saved-tensor hooks, sequential
+* `python/trainpool_torch`: local SDK, tensor table, saved-tensor hooks, graph and sequential
   recomputation, remote optimizer state and bounded prefetch.
 
 The one executable includes daemon and CLI commands. `run` launches a structured
@@ -79,25 +79,21 @@ sequentially, and stores an EWMA of effective bandwidth. Unmeasured links are vi
 unmeasured and use a conservative 10 MB/s, 10 ms planning prior. There is no continuous
 background bulk bandwidth test. Reported RTT includes authentication/dispatch overhead.
 
-## Scheduling and heterogeneous GPUs
+## Single-primary-GPU scheduling
 
-A `TrainingPlan` records job ID, leader generation, GPU assignments, compute node IDs,
-RAM node IDs, placement policy, memory budget snapshot, topology snapshot and explicit
-stage assignments. A node with `gpu_compute=false` cannot receive a GPU assignment.
-No GPU produces `MemoryOnly`. With no explicit stage descriptions, one or more usable
-GPUs produce an executable `SingleGpuDistributedMemory` plan containing only the
-largest usable GPU (then stable GPU/node ID). The other GPUs remain visible inventory;
-their VRAM is not counted as participating in that job.
+The eligible GPU with largest usable VRAM is selected deterministically (GPU UUID,
+then node UUID break ties). All supplied stage assignments use that GPU. Additional
+GPUs remain inventory and do not contribute executable capacity to a job. CPU-only
+nodes may lead and provide RAM, but never run CUDA kernels. Cross-host GPU execution,
+remote Python workers and data parallelism are not implemented.
 
-The experimental heterogeneous planner accepts `{name, working_set_bytes}` stage
-descriptions. It places each complete stage only on a GPU with enough usable capacity
-and balances accumulated stage bytes relative to each GPU's usable capacity. Capacity
-shares derive from real usable VRAM, not equal `1/N` partitions. The working set must
-include the caller's estimates for activations, gradients and operator workspace.
+Transparent Python execution captures a DAG, groups adjacent operations while
+preserving boundary dependencies, and uses metadata admission to split oversized
+groups. Parameters, buffers, forward boundaries and accumulated gradients are backed
+by the existing fabric. See [adapter semantics](pytorch.md) for recomputation,
+BatchNorm/RNG correctness, checkpoints and current limitations.
 
-Explicit multi-GPU stage plans are implemented and tested; executing those plans across
-GPU hosts is not.
-`execution_supported=false` makes this explicit in experimental plans. The Python
-sequential adapter deliberately rejects such a plan. Future execution needs a bounded,
-typed module/operator protocol, validation of model definitions and cross-stage gradient
-transport—not an arbitrary remote Python/shell endpoint.
+Cluster VRAM sums are inventory. New-job logical backing capacity is primary GPU
+usable VRAM plus the pool RAM budget. Remaining logical capacity uses allocatable RAM
+instead. Owned RAM is already part of the budget. Neither measure creates a combined
+CUDA address space or permits an individual operator to exceed primary GPU capacity.

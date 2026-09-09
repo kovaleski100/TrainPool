@@ -81,14 +81,10 @@ fn unequal_gpu_stages_obey_working_set_capacity() {
     let plan = CapacityPlanner
         .plan(&nodes, &elect(nodes.iter()), &Topology::default(), &stages)
         .unwrap();
-    assert!(plan.gpu_assignments[0].capacity_share > plan.gpu_assignments[2].capacity_share);
-    let counts: Vec<_> = plan
-        .gpu_assignments
-        .iter()
-        .map(|g| plan.stages.iter().filter(|s| s.gpu_id == g.gpu_id).count())
-        .collect();
-    assert!(counts[0] > counts[2]);
-    assert!(!plan.execution_supported);
+    assert_eq!(plan.gpu_assignments.len(), 1);
+    assert_eq!(plan.gpu_assignments[0].capacity_share, 1.0);
+    assert!(plan.stages.iter().all(|s| s.node_id == nodes[0].node_id));
+    assert!(plan.execution_supported);
     assert!(
         CapacityPlanner
             .plan(
@@ -268,4 +264,43 @@ async fn ram_allocation_lifetime_and_leases() {
     assert!(accounting.reserve(3).is_err());
     drop(held);
     assert_eq!(accounting.used(), 0);
+}
+
+#[test]
+fn inventory_is_not_executable_capacity_and_primary_ties_are_stable() {
+    use trainpool::protocol::LogicalTrainingMemory;
+    let mut nodes = vec![
+        node(1, 32, Some(12)),
+        node(2, 64, Some(12)),
+        node(3, 16, Some(4)),
+    ];
+    let first = CapacityPlanner
+        .plan(&nodes, &elect(nodes.iter()), &Topology::default(), &[])
+        .unwrap();
+    let memory = LogicalTrainingMemory::from_nodes(&nodes);
+    assert_eq!(memory.cluster_physical_vram, 28 * GIB);
+    assert_eq!(memory.primary_gpu_physical_vram, 12 * GIB);
+    assert_eq!(
+        memory.current_job_backing_capacity,
+        memory.primary_gpu_usable_vram + memory.pool_ram_budget
+    );
+    assert_eq!(
+        memory.logical_training_capacity,
+        memory.primary_gpu_usable_vram + memory.pool_ram_allocatable
+    );
+    nodes.reverse();
+    let second = CapacityPlanner
+        .plan(&nodes, &elect(nodes.iter()), &Topology::default(), &[])
+        .unwrap();
+    assert_eq!(
+        first.gpu_assignments[0].gpu_id,
+        second.gpu_assignments[0].gpu_id
+    );
+    for node in &mut nodes {
+        node.runtime.gpu_compute = false;
+    }
+    assert_eq!(
+        LogicalTrainingMemory::from_nodes(&nodes).primary_gpu_usable_vram,
+        0
+    );
 }

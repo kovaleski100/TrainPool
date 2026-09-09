@@ -243,16 +243,19 @@ pub async fn execute(cli: Cli) -> Result<()> {
     if matches!(cli.command, Command::Memory | Command::Status) {
         let m = status.logical_memory;
         for (label, value) in [
-            ("Physical GPU VRAM", m.physical_vram),
+            ("Cluster physical VRAM (inventory)", m.cluster_physical_vram),
             ("Currently free GPU VRAM", m.free_vram),
-            ("Usable GPU VRAM", m.usable_vram),
+            ("Cluster usable VRAM (inventory)", m.cluster_usable_vram),
+            ("Primary GPU physical VRAM", m.primary_gpu_physical_vram),
+            ("Primary GPU usable VRAM", m.primary_gpu_usable_vram),
+            ("Job backing capacity", m.current_job_backing_capacity),
             ("TrainPool allocated VRAM (SDK reports)", m.allocated_vram),
             ("Physical system RAM", m.physical_ram),
             ("Pool RAM budget", m.pool_ram_budget),
             ("Allocated pool RAM", m.allocated_ram),
             ("Currently allocatable pool RAM", m.pool_ram_allocatable),
             (
-                "Logical training capacity available",
+                "Job remaining logical capacity",
                 m.logical_training_capacity,
             ),
         ] {

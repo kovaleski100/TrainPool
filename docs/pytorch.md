@@ -1,145 +1,135 @@
 # PyTorch adapter semantics
 
-The SDK is a library in `python/trainpool_torch`, not a second daemon. It requires a
-local loopback TrainPool endpoint and contains no torch.distributed RPC, pickle or
-remote Python execution. RAM-only peers need only the Rust binary.
+Run ordinary code with `trainpool python train.py`. The process-local bootstrap
+intercepts `model.to("cuda")` / `model.cuda()` before full CUDA materialization,
+captures the model, transfers state to the existing RAM fabric, and preserves the
+root model and optimizer identities. RAM providers execute no Python and require
+neither PyTorch nor CUDA. Normal SDK imports do not activate instrumentation.
 
-## Normal transparent execution
+## Graph execution
 
-Run an unchanged program with `trainpool python train.py`. A temporary, process-local
-`sitecustomize.py` calls `trainpool_torch.bootstrap.autoinstall()` only when the launcher
-sets `TRAINPOOL_ACTIVE=1`. Importing `trainpool_torch` normally still imports neither
-PyTorch nor CUDA.
+`graph.py` uses PyTorch FX as a capture frontend. Its `GraphIR` records producers,
+group consumers, boundary inputs/outputs, sizes, remaining consumers and next use.
+The original DAG remains intact. Adjacent operations are grouped (up to 12 nodes,
+with boundaries at fan-out and parameter-budget limits), retaining every value with
+an external consumer. Multiple inputs and outputs are supported. If metadata
+execution estimates that a group exceeds the primary GPU budget, the runtime
+splits it and repeats admission. A single operator that still exceeds the estimate
+fails with `TRAINPOOL_UNSUPPORTED_WORKING_SET` before tensor restoration.
 
-The bootstrap intercepts CUDA movement for supported nonempty `nn.Sequential` models
-before PyTorch materializes the whole model in VRAM. It preserves model identity,
-attaches the existing stage runtime, discovers fresh SGD/Adam/AdamW optimizers in either
-common construction order, preserves optimizer identity and parameter groups, and
-delegates forward, backward state handling, `zero_grad()` and `step()`. Transparent
-stores use automatic placement (`preferred_node=None`). Model `state_dict()` and
-optimizer `state_dict()` restore ordinary CPU tensors sequentially; their
-`load_state_dict()` methods currently fail explicitly rather than risking corruption.
+Forward executes one group at a time under no-grad with `torch.func.functional_call`.
+Only its parameters, buffers and inputs are restored. All tensor boundaries,
+including skips needed by later decoder groups, are offloaded immediately. Local
+intermediates remain ordinary PyTorch tensors within the group. Tensor payloads use
+independent fabric handles; tuple/list/dict/ordered-mapping metadata stays inside
+the process and is not pickled or sent as executable Python objects.
 
-Compatibility is reported as FULL, PARTIAL, or UNSUPPORTED. FULL currently means the
-sequential restrictions below are satisfied and parameters, recomputed/saved inputs,
-gradients, and optimizer state use the capacity runtime. PARTIAL does not claim to solve
-model OOM. Unsupported CUDA model movement raises `TRAINPOOL_UNSUPPORTED_GRAPH` before
-ordinary full-model CUDA movement. Ultralytics may be named in diagnostics, but YOLO is
-not claimed as FULL-compatible.
+Backward visits the DAG in reverse topological group order. It restores the required
+boundary inputs and state, recomputes locally with autograd, and uploads input and
+parameter gradients. Contributions at fan-out are **added**, including when separate
+outputs contribute to the same input. Gradients are never replaced by the last
+branch. Saved boundary values are freed after their final backward use. In inference,
+RAM boundaries can be freed after their final forward consumer. GPU copies live only
+for the active group and gradient accumulation operation; the input/output tensors
+held by the user's script remain the script's responsibility.
 
-## Advanced explicit APIs
+## Mutable buffers and randomness
 
-`TensorStore.offload(tensor)` returns a logical `TensorHandle` containing full shape,
-dtype, byte length, original device, contiguous layout, expected next use, dirty/clean
-state and ordered remote block handles. `restore(handle)` allocates on the recorded
-device and fills it from checked chunks. `free` releases RAM blocks. Restoring a CUDA
-tensor never falls back to CPU because its backing node lacks a GPU.
+BatchNorm running mean, variance and batch counters are persistent RAM-backed state.
+Forward saves the pre-forward buffers, executes once and commits the resulting state.
+Backward restores the pre-forward snapshot into temporary tensors and discards any
+recomputation mutations. It never commits these mutations to persistent buffers.
+Each group's CPU and selected-device CUDA RNG states are recorded. Replay runs inside
+`torch.random.fork_rng`, reproducing Dropout while restoring the user's global state.
 
-`distributed_memory()` uses PyTorch saved-tensors hooks to pack saved activations into
-the store and unpack them for backward. The restored values have identical dtype,
-shape and content. Tensor ownership objects release blocks when the autograd graph
-releases them; the context closes any remaining objects. Finish backward inside the
-context. This mechanism alone does not release ordinary model parameters or optimizer
-states. It remains a research/debugging interface.
+Module training/evaluation modes are propagated before execution. FX specializes
+Python boolean flags: a model using functional Dropout whose captured root training
+mode changes is explicitly rejected. Module-based Dropout/BatchNorm mode changes work.
+Unknown stateful leaves, hooks, tied/reused parameters and alias-sensitive in-place
+operations are rejected. Safe leaf activations are executed without in-place mutation.
 
-`prepare(nn.Sequential, optimizer)` transfers ownership and returns a
-`CapacitySequential` and `CapacityOptimizer`. It supports SGD, Adam and AdamW with one
-parameter group and initially empty optimizer state. Initial model parameters must
-fit in the host process before preparation. Parameters are uploaded one stage at a
-time and the original modules become metadata-only PyTorch meta templates. Do not
-reuse the original model/optimizer or keep external references expecting them to be
-updated in place.
+## Optimizers and checkpoints
 
-## Training algorithm
+SGD, Adam and AdamW use the existing capacity optimizer, restoring one execution
+group at a time. No update begins until DAG backward has completed. Parameters,
+gradients and tensor-valued optimizer state return to RAM. Multiple parameter groups,
+optimizer closures, populated optimizers at initial interception, capturable, fused
+and differentiable optimizers are explicitly unsupported. Scheduler changes to the
+supported group's options are read on each step.
 
-Forward uses a custom autograd function:
+`model.state_dict()`, `model.load_state_dict(...)`, `optimizer.state_dict()` and
+`optimizer.load_state_dict(...)` work for supported transparent models. Snapshots
+contain ordinary CPU tensors in original model/optimizer parameter order, including
+BatchNorm buffers. Loading validates key/shape/group compatibility and stages all
+uploads before publishing replacements. Model loading supports `strict=False`;
+`assign=True` and loading during a pending training step are rejected. A transport
+failure during publication makes the job unusable; this is not distributed recovery.
+Checkpoint I/O is an explicit application action, not fabric disk spill. Full
+snapshots require enough host RAM, just as initial model construction does.
 
-1. Restore the current stage's weights on the one selected CUDA device.
-2. Offload that stage's input and remember CPU/CUDA random-number state.
-3. Start look-ahead loading the next stage's weights if enabled.
-4. Execute `torch.func.functional_call` with the restored weights under no-grad.
-5. Release the current temporary weights. Only the output goes to the next stage.
+User-visible parameter objects are meta placeholders. Their ordinary `.grad` fields
+are not a GPU gradient cache; gradients are owned by the capacity optimizer. Gradient
+clipping and arbitrary operations on placeholder parameters are not supported.
+`runtime.named_training_parameters(device="cpu")` is an advanced inspection interface.
+One forward/backward/step may be in flight; retained graphs, gradient accumulation
+across batches, higher-order gradients and AMP/GradScaler are not supported.
 
-Backward traverses stages in reverse:
+## Capacity and transfers
 
-1. Restore that stage's saved input and unchanged weights.
-2. Replay its saved RNG inside `torch.random.fork_rng`, recompute with autograd enabled,
-   and compute the input/parameter gradients with `torch.autograd.grad`.
-3. Pass the input gradient to the preceding stage; offload parameter gradients to RAM.
-4. Release input/weight/recomputation objects and free the consumed saved input.
+There is exactly one selected GPU, including for explicitly supplied stage plans.
+CUDA movement checks both the selected node and GPU UUID. If CUDA is unavailable,
+`TRAINPOOL_NO_CUDA` is emitted. There is no CPU fallback. `TRAINPOOL_TEST_CPU=1` is
+only the transparent numerical-test backend, explicitly reported as `test-cpu`.
 
-The returned optimizer processes one stage at a time. It restores parameters,
-gradients and that stage's tensor-valued momentum/Adam state, executes the ordinary
-PyTorch optimizer, uploads new parameters/state, and frees previous blocks only after
-uploads succeed. Adam's scalar step tensors retain their original device. No parameter
-update happens before all stage backwards complete, preserving ordinary training
-semantics. An error marks the prepared model failed; a partial optimizer step is not
-silently retried or claimed to be transactional across stages.
+Shape admission runs metadata kernels, accounting conservatively for parameters,
+buffers, all group intermediates, gradients and workspace headroom. Available CUDA
+memory is checked again before restoring a group. Backend-dependent CUDA workspace
+allocation can still fail; such failures are reported as
+`TRAINPOOL_UNSUPPORTED_WORKING_SET`, never retried by materializing the full model or
+running CPU kernels. **These estimates are not an allocator-enforced CUDA limit.**
+Physical peak residency and actual workspace behavior remain hardware release gates.
 
-## Prefetch
+Graph execution uses deterministic demand restoration. It does not concurrently
+prefetch another group's GPU parameters. The explicit Sequential API retains its
+optional one-worker look-ahead prefetch, with `prefetch_depth=0/1`.
 
-`prefetch_depth=0` selects `NoPrefetch`. Depth one selects `SequentialPrefetch`: one
-worker and at most one pending stage. It predicts the next forward stage or previous
-backward stage. CUDA copies are explicit and synchronous with respect to their staging
-buffer; the background worker overlaps them with the foreground stage. A “hit” means
-the future had completed at consumption. A “miss” means it was absent or still pending.
-Pending futures are drained/cleared by `model.close()`.
+The default tensor block size is at most 4 MiB, independently of 64 KiB host staging
+pieces. Upload/download streaming verifies chunk and complete-block checksums. This
+keeps transfer staging bounded even on a node whose RAM contribution is smaller than
+one parameter. The daemon's RAM accounting covers SDK staging and relay reservations.
+Normal placement is automatic; no node UUID is needed in a training script.
 
-Only one batch can be in flight. Parameters of the active and prefetched stages may
-coexist, in addition to the operator's live activations/workspace. Admission uses a
-conservative estimate, not an allocator interception. The user must choose stage
-boundaries whose **actual** working set fits the GPU. Disable prefetch when the extra
-stage would use needed VRAM. Throughput is secondary to capacity.
+## Supported graph operations
 
-## Supported scope
+The allowlist includes dense convolutions (including dilation and ConvTranspose2d),
+Linear, BatchNorm, LayerNorm, GroupNorm, common activations, Dropout, pooling,
+Upsample, functional interpolation/padding, concatenation, residual arithmetic,
+shape access, indexing and standard reshape/transpose operations. It is a bounded
+initial frontend, not arbitrary PyTorch compatibility. Diagnostics identify the
+unsupported graph/node/operator/buffer/output or working set.
+Shared buffers, buffers outside the captured graph, complex training state and
+custom checkpoint extra state are rejected before replacing the model's tensors.
 
-Built-in pure stages include Linear, dense convolution, LayerNorm, common non-inplace
-activations, Flatten, Identity and nested Sequential. Inputs/outputs are single floating
-point tensors. Parameters must not be shared/tied. Mutable buffers such as BatchNorm
-running statistics are rejected. Unknown pure single-input/output blocks can be
-explicitly annotated with `tp.stage(module)`; the caller promises no buffer mutation,
-input mutation or external side effects. RNG replay supports recomputable randomness.
+`FULL` means this runtime owns the model parameters, buffers, boundary activations,
+gradients and optimizer state. `PARTIAL` never claims to fix full-model CUDA OOM.
+Unsupported capture fails at CUDA model movement, before ordinary PyTorch can place
+the whole model there. Models with input-dependent Python control flow, custom
+operators, unsupported state mutation, DDP/FSDP and multi-GPU compute remain outside
+this milestone.
 
-Unsupported: arbitrary graphs, DDP, automatic graph partitioning, multiple GPU execution,
-multiple optimizer groups, populated pre-prepare optimizer state, closures, differentiable/
-capturable/fused optimizers, automatic mixed precision/GradScaler integration, gradient
-accumulation, retained graphs, higher-order gradients, shared weights, sparse/quantized
-tensors, and transparent checkpoint loading. Use
-`named_training_parameters(device=...)` to inspect one restored parameter at a time.
-Collecting that iterator into a dict deliberately materializes a full snapshot in RAM.
+## Advanced existing APIs
 
-Zero-length tensors are metadata-only; scalar, bfloat16 and non-contiguous tensors are
-covered by round-trip tests. Non-contiguous normalization may allocate a full contiguous
-copy on the original device. Models prepared in evaluation/no-grad mode run stages
-without saving backward inputs.
+`TensorStore`, `distributed_memory`, `stage`, and `prepare(nn.Sequential, optimizer)`
+remain available. The explicit Sequential wrapper retains its original pure-stage
+restrictions and ownership-transfer semantics. `distributed_memory` alone offloads
+saved activations and does not claim to solve parameter or optimizer capacity.
+Close explicit stores/runtimes with `try/finally` or context management. Transparent
+stores are closed at process exit. Leases bound retention after unreachable-node
+cleanup; warnings identify cleanup deferred to expiry.
 
-CUDA mode verifies both PyTorch CUDA availability and that the local daemon is the
-single planned GPU compute provider. A CPU-only leader cannot execute a CUDA stage.
-`_test_cpu=True` plus `device="cpu"` is an explicit numerical test backend; it is never
-selected from tensor location or driver failure. Transparent subprocess tests use the
-equally test-only `TRAINPOOL_TEST_CPU=1` switch and report `backend=test-cpu`; production
-does not select it automatically. `examples/train_sequential.py --test-cpu` labels its
-output as simulation.
+## API references
 
-## Metrics and cleanup
-
-The daemon records actual remote byte counts. The SDK reports CUDA transfer bytes,
-prefetch hits/misses, foreground data waiting time and PyTorch allocator residency.
-Allocator numbers are process observations; use one job per process when attributing
-them to a job. Waiting time is wall time blocked on data, not a CUDA profiler's exact
-GPU-idle measurement. There is no fabricated GPU metric for the CPU backend.
-
-Transparent mode registers `atexit` cleanup for stores and prefetch workers. Explicit
-mode should use `try/finally: model.close()` or a `TensorStore` context, and close the
-prefetcher before closing a supplied store. A lease renewal thread retains live RAM
-objects.
-If cleanup cannot reach a node, expiry bounds retention; the cleanup warning identifies
-this rather than pretending all remote allocations were freed.
-
-## Primary API references
-
-The implementation uses the documented
-[saved-tensors hooks and autograd APIs](https://docs.pytorch.org/docs/2.14/autograd.html)
-and [functional module calls](https://docs.pytorch.org/docs/stable/generated/torch.func.functional_call.html).
-Tests compare outputs, input gradients and updated parameters against ordinary
-PyTorch across multiple steps for SGD, Adam and AdamW, both with and without prefetch.
+The implementation uses PyTorch's [FX graphs](https://docs.pytorch.org/docs/2.14/fx.html),
+[functional calls](https://docs.pytorch.org/docs/2.14/generated/torch.func.functional_call.html)
+and [autograd](https://docs.pytorch.org/docs/2.14/autograd.html). Accepted DeepLab
+features follow the actual [torchvision implementation](https://docs.pytorch.org/vision/stable/_modules/torchvision/models/segmentation/deeplabv3.html).

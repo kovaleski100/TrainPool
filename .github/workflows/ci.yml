@@ -15,9 +15,9 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       - run: cargo build --locked --release
-      - run: python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - run: python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
       - run: python -m pip install -e './python[test]'
-      - run: ruff check python tests/python examples scripts
-      - run: ruff format --check python tests/python examples scripts
+      - run: ruff check python tests/python tests/models examples scripts
+      - run: ruff format --check python tests/python tests/models examples scripts
       - run: pytest -q
       - run: python scripts/two_node_demo.py

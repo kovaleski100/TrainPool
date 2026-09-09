@@ -26,6 +26,8 @@ def cluster(tmp_path_factory):
     try:
         for index, port in enumerate(ports):
             directory = root / str(index)
+            directory.mkdir()
+            (directory / "config.toml").write_text("lease_seconds = 10\n")
             processes.append(
                 subprocess.Popen(
                     [

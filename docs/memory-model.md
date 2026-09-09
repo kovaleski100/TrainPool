@@ -105,7 +105,8 @@ contributes to active capacity. Affected jobs fail explicitly. Leadership metada
 job state are in-memory; leader failover does not transparently resume training.
 
 There is no file-backed block backend, mmap tensor file, tempfile tensor serialization,
-pickle checkpoint, disk spill implementation or TrainPool-managed swap. `Disk` is a
+automatic checkpoint, disk spill implementation or TrainPool-managed swap. Explicit
+user-requested PyTorch checkpoint files are supported outside the fabric. `Disk` is a
 reserved enum variant only. `disk.enabled=true` and `--enable-disk-spill` fail validation.
 Only identity and configuration are written by the runtime. Logs contain structured
 metadata, never tensor bodies. The test/demo scripts may create temporary **metadata**
@@ -115,3 +116,19 @@ The OS may independently page ordinary process memory to its configured swap. Tr
 does not manage that swap or promise page locking. Experiments requiring a literal
 no-storage-I/O guarantee must use hosts with paging disabled or a separately validated
 locked-memory deployment. Adding optional mlock accounting is a possible future extension.
+
+
+## Inventory versus job capacity
+
+`cluster_physical_vram` / `cluster_usable_vram` sum inventory. Only the largest
+eligible GPU contributes `primary_gpu_physical_vram` / `primary_gpu_usable_vram`.
+`pool_ram_budget` includes `pool_ram_owned`; `pool_ram_allocatable` is the remaining
+safe pool contribution. Current status is a cluster snapshot for a new single-GPU
+job, not a reservation or a guarantee for an already running job. Job plans pin the
+selected GPU; inventory refresh does not migrate computation.
+
+`current_job_backing_capacity = primary_gpu_usable_vram + pool_ram_budget` and
+`current_job_remaining_capacity = primary_gpu_usable_vram + pool_ram_allocatable`.
+The old `logical_training_capacity` JSON field remains a compatibility alias for
+the corrected remaining capacity. Old `physical_vram` / `usable_vram` fields remain
+inventory aliases. No other GPU's VRAM enters the executable capacity calculation.

@@ -124,9 +124,7 @@ def automatic_cluster(tmp_path):
                 process.wait()
 
 
-def test_zero_import_script_runs_unchanged_with_identity_and_numerical_parity(
-    automatic_cluster, tmp_path
-):
+def test_zero_import_script_runs_unchanged_with_identity_and_numerical_parity(automatic_cluster, tmp_path):
     clients = automatic_cluster
     root = Path(__file__).resolve().parents[2]
     script = tmp_path / "ordinary.py"
@@ -248,3 +246,133 @@ print(id(model) == identity, all(parameter.device.type == "meta" for parameter i
         environment=environment,
     )
     assert result.stdout.strip() == "True True"
+
+
+@pytest.fixture(scope="module")
+def segmentation_cluster(tmp_path_factory):
+    directory = tmp_path_factory.mktemp("segmentation-fabric")
+    root = Path(__file__).resolve().parents[2]
+    binary = os.getenv("TRAINPOOL_BINARY", str(root / "target/debug/trainpool"))
+    ports = [_free_port(), _free_port()]
+    discovery = _free_port(socket.SOCK_DGRAM)
+    processes = []
+    try:
+        for index, limit in enumerate((1, 1536)):
+            processes.append(
+                subprocess.Popen(
+                    [
+                        binary,
+                        "--data-dir",
+                        str(directory / str(index)),
+                        "daemon",
+                        "--listen",
+                        f"127.0.0.1:{ports[index]}",
+                        "--advertise-ip",
+                        "127.0.0.1",
+                        "--multicast-interface",
+                        "127.0.0.1",
+                        "--discovery-port",
+                        str(discovery),
+                        "--ram-limit-mib",
+                        str(limit),
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            )
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            try:
+                clients = [Client(f"127.0.0.1:{port}") for port in ports]
+                if all(len(client.status["nodes"]) == 2 for client in clients):
+                    yield clients
+                    return
+            except (OSError, RuntimeError):
+                pass
+            time.sleep(0.2)
+        raise RuntimeError("segmentation cluster discovery timeout")
+    finally:
+        for process in processes:
+            process.terminate()
+        for process in processes:
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+
+@pytest.mark.parametrize("script", ["unet_train.py", "deeplab_train.py"])
+def test_ordinary_segmentation_scripts_via_launcher(segmentation_cluster, tmp_path, script):
+    import torch
+
+    clients = segmentation_cluster
+    root = Path(__file__).resolve().parents[2]
+    for path in (root / "tests/models").glob("*_train.py"):
+        source = path.read_text()
+        for forbidden in (
+            "trainpool_torch",
+            "TensorStore",
+            "prepare(",
+            "preferred_node",
+            "distributed_memory",
+        ):
+            assert forbidden not in source
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(root / "python")
+    environment.pop("TRAINPOOL_ACTIVE", None)
+    args = [
+        sys.executable,
+        str(root / "tests/models" / script),
+        "--size",
+        "16",
+        "--steps",
+        "2",
+        "--width",
+        "32",
+    ]
+    baseline = subprocess.run(
+        args + ["--device", "cpu", "--checkpoint", str(tmp_path / "baseline.pt")],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert baseline.returncode == 0, baseline.stderr
+    environment["TRAINPOOL_TEST_CPU"] = "1"
+    binary = os.getenv("TRAINPOOL_BINARY", str(root / "target/debug/trainpool"))
+    result = subprocess.run(
+        [
+            binary,
+            "--address",
+            f"{clients[0].address[0]}:{clients[0].address[1]}",
+            *args,
+            "--device",
+            "cuda",
+            "--input-device",
+            "cpu",
+            "--checkpoint",
+            str(tmp_path / "actual.pt"),
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "compatibility=FULL" in result.stderr
+    expected, actual = json.loads(baseline.stdout), json.loads(result.stdout)
+    assert len(actual["loss"]) == 2
+    # Float32 residual/BN accumulation can diverge more than reduced float64 CI.
+    torch.testing.assert_close(
+        torch.tensor(actual["loss"]), torch.tensor(expected["loss"]), rtol=0.002, atol=0.002
+    )
+    if script == "unet_train.py":
+        expected_state = torch.load(tmp_path / "baseline.pt", weights_only=True)["model"]
+        actual_state = torch.load(tmp_path / "actual.pt", weights_only=True)["model"]
+        for name in expected_state:
+            torch.testing.assert_close(actual_state[name], expected_state[name], rtol=0.001, atol=0.0001)
+    jobs = clients[0].control("metrics")["jobs"]
+    assert any(
+        job["bytes_local_to_remote_ram"] > 0 and job["bytes_remote_ram_to_local"] > 0 for job in jobs.values()
+    )

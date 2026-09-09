@@ -89,7 +89,7 @@ def test_no_disk_tensor_backing(cluster):
         torch.testing.assert_close(store.restore(handle), original)
     after = {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
     assert before == after
-    assert all(p.name == "node_id" for p in root.rglob("*") if p.is_file())
+    assert all(p.name in {"node_id", "config.toml"} for p in root.rglob("*") if p.is_file())
 
 
 def test_no_implicit_cpu_compute_and_unsupported_graph_rejected():
@@ -176,3 +176,32 @@ def test_training_example_exceeds_configured_residency_with_remote_state(cluster
     assert first["remote_backing_bytes"] > 0
     assert first["backend"] == "explicit CPU simulation"
     assert not first["disk_spill"]
+
+
+def test_remote_allocations_survive_lease_renewal_and_prefetch(cluster):
+    import time
+
+    from trainpool_torch.store import SequentialPrefetch, TensorStore
+
+    clients, _ = cluster
+    with TensorStore(clients[0], preferred_node=clients[1].local_node) as store:
+        value = torch.arange(32, dtype=torch.float64)
+        held = store.offload(value)
+        initial_expiry = held.blocks[0]["lease_expires_ms"]
+        for _ in range(1100):
+            handle = store.offload(value)
+            torch.testing.assert_close(store.restore(handle), value)
+            store.free(handle)
+        deadline = time.monotonic() + 12
+        while held.blocks[0]["lease_expires_ms"] <= initial_expiry:
+            assert time.monotonic() < deadline, "lease renewal did not run"
+            time.sleep(0.1)
+        remaining = max(0, initial_expiry / 1000 - time.time()) + 0.1
+        time.sleep(remaining)
+        prefetch = SequentialPrefetch(store)
+        try:
+            prefetch.schedule("held", lambda: store.restore(held))
+            torch.testing.assert_close(prefetch.take("held", lambda: store.restore(held)), value)
+        finally:
+            prefetch.close()
+        assert len(store.tensors) == 1

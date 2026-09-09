@@ -42,7 +42,9 @@ class TensorStore:
             else self.client.control("job_status", job_id=job_id)["plan"]
         )
         self.job_id = self.plan["job_id"]
-        self.block_bytes = min(block_bytes or self.client.chunk_bytes, self.client.chunk_bytes)
+        # Blocks and staging are independent: large blocks avoid metadata churn,
+        # while at most 64 KiB of host payload is staged for each transfer.
+        self.block_bytes = min(block_bytes or 4 * 1024 * 1024, self.client.chunk_bytes)
         if self.block_bytes < 4096:
             raise ValueError("block_bytes must be at least 4096")
         self.tensors = {}
@@ -65,7 +67,14 @@ class TensorStore:
         if device.type == "cuda":
             if self.client.local_node not in self.plan["compute_nodes"]:
                 raise TrainPoolError("TRAINPOOL_NO_CUDA: local node is not a CUDA compute provider")
-            self._gpu_device = device
+            import torch
+
+            index = device.index if device.index is not None else torch.cuda.current_device()
+            selected = self.plan["gpu_assignments"][0]["gpu_id"].removeprefix("GPU-").lower()
+            actual = str(torch.cuda.get_device_properties(index).uuid).removeprefix("GPU-").lower()
+            if actual != selected:
+                raise TrainPoolError("TRAINPOOL_NO_CUDA: tensor device is not the selected primary GPU")
+            self._gpu_device = torch.device("cuda", index)
 
     def _check(self):
         if self._closed.is_set():
@@ -112,14 +121,20 @@ class TensorStore:
         try:
             for offset in range(0, raw.numel(), self.block_bytes):
                 size = min(self.block_bytes, raw.numel() - offset)
-                with self.client.staging(size):
-                    chunk = raw[offset : offset + size].to("cpu")
-                    block = self.client.put(
-                        memoryview(chunk.numpy()), self.job_id, preferred_node=self.preferred_node
-                    )
-                    with self._lock:
-                        handle.blocks.append(block)
-                    del chunk
+
+                def chunks(offset=offset, size=size):
+                    for start in range(offset, offset + size, 65536):
+                        length = min(65536, offset + size - start)
+                        with self.client.staging(length):
+                            chunk = raw[start : start + length].to("cpu")
+                            yield memoryview(chunk.numpy())
+                            del chunk
+
+                block = self.client.put_chunks(
+                    size, chunks(), self.job_id, preferred_node=self.preferred_node
+                )
+                with self._lock:
+                    handle.blocks.append(block)
             with self._lock:
                 handle.dirty = False
                 if tensor.device.type == "cuda":
@@ -146,15 +161,12 @@ class TensorStore:
         raw = result.reshape(-1).view(torch.uint8)
         offset = 0
         for block in handle.blocks:
-            size = block["size"]
-            with self.client.staging(size):
-                buffer = bytearray(size)
-                self.client.read_into(block, buffer)
+            for buffer in self.client.read_chunks(block):
                 source = torch.frombuffer(buffer, dtype=torch.uint8)
-                raw[offset : offset + size].copy_(source)
-                # copy_ is synchronous here; host memory remains alive until GPU copy completes.
+                raw[offset : offset + len(buffer)].copy_(source)
+                offset += len(buffer)
+                # Synchronous copy keeps the bounded host buffer alive until done.
                 del source, buffer
-            offset += size
         with self._lock:
             if target.type == "cuda":
                 self.metrics["bytes_local_ram_to_gpu"] += handle.size

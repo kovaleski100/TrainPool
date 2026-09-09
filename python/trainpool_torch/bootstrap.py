@@ -28,6 +28,7 @@ class Compatibility(str, Enum):
 class _ModelRecord:
     runtime: object
     original_parameter_ids: frozenset
+    original_parameter_order: tuple
     current_parameter_ids: frozenset
     placeholder_parameters: tuple
     requested_device: object
@@ -53,9 +54,7 @@ def _internal_movement():
 
 
 def _optimizer_parameter_ids(optimizer):
-    return frozenset(
-        id(parameter) for group in optimizer.param_groups for parameter in group["params"]
-    )
+    return frozenset(id(parameter) for group in optimizer.param_groups for parameter in group["params"])
 
 
 def _matching_record(parameter_ids):
@@ -84,9 +83,7 @@ def _attach_optimizer(optimizer):
     if record is None:
         _, overlap = _overlapping_record(parameter_ids)
         if overlap is not None:
-            raise TrainPoolError(
-                "TRAINPOOL_UNSUPPORTED_OPTIMIZER: parameters must match the complete model"
-            )
+            raise TrainPoolError("TRAINPOOL_UNSUPPORTED_OPTIMIZER: parameters must match the complete model")
         return
     if type(optimizer) not in SUPPORTED_OPTIMIZERS:
         raise TrainPoolError(
@@ -96,13 +93,22 @@ def _attach_optimizer(optimizer):
     if len(optimizer.param_groups) != 1:
         raise TrainPoolError("TRAINPOOL_UNSUPPORTED_OPTIMIZER: multiple parameter groups")
     if not hasattr(optimizer, "_trainpool_delegate"):
-        if len(optimizer.param_groups[0]["params"]) != len(record.placeholder_parameters):
+        order = tuple(id(parameter) for parameter in optimizer.param_groups[0]["params"])
+        if order not in (
+            record.original_parameter_order,
+            tuple(id(p) for p in record.placeholder_parameters),
+        ):
             raise TrainPoolError(
-                "TRAINPOOL_UNSUPPORTED_OPTIMIZER: parameters must match the complete model"
+                "TRAINPOOL_UNSUPPORTED_OPTIMIZER: parameter order must match model.parameters()"
             )
+        if len(optimizer.param_groups[0]["params"]) != len(record.placeholder_parameters):
+            raise TrainPoolError("TRAINPOOL_UNSUPPORTED_OPTIMIZER: parameters must match the complete model")
         optimizer.param_groups[0]["params"][:] = record.placeholder_parameters
         _optimizers[optimizer] = record.current_parameter_ids
-        attach_optimizer_inplace(optimizer, record.runtime)
+        try:
+            attach_optimizer_inplace(optimizer, record.runtime)
+        except ValueError as error:
+            raise TrainPoolError(f"TRAINPOOL_UNSUPPORTED_OPTIMIZER: {error}") from error
 
 
 def _requested_cuda(torch, args, kwargs):
@@ -136,21 +142,21 @@ def _requested_dtype(torch, args, kwargs):
 def _activate_model(model, requested_device):
     import torch
 
-    from .sequential import SUPPORTED_OPTIMIZERS, _validate_model, prepare_model_inplace
+    from .graph import capture, prepare_graph_inplace
+    from .sequential import SUPPORTED_OPTIMIZERS
     from .store import TensorStore
 
     if model in _models:
         return model
-    original_parameter_ids = frozenset(id(parameter) for parameter in model.parameters())
+    original_parameter_order = tuple(id(parameter) for parameter in model.parameters())
+    original_parameter_ids = frozenset(original_parameter_order)
     related = [
         optimizer
         for optimizer, parameter_ids in list(_optimizers.items())
         if parameter_ids & original_parameter_ids
     ]
     if any(_optimizers[optimizer] != original_parameter_ids for optimizer in related):
-        raise TrainPoolError(
-            "TRAINPOOL_UNSUPPORTED_OPTIMIZER: parameters must match the complete model"
-        )
+        raise TrainPoolError("TRAINPOOL_UNSUPPORTED_OPTIMIZER: parameters must match the complete model")
     matching = related
     for optimizer in matching:
         if type(optimizer) not in SUPPORTED_OPTIMIZERS:
@@ -158,7 +164,7 @@ def _activate_model(model, requested_device):
                 f"TRAINPOOL_UNSUPPORTED_OPTIMIZER: {type(optimizer).__module__}.{type(optimizer).__name__}"
             )
     try:
-        _validate_model(model)
+        graph = capture(model)
     except (TypeError, ValueError) as error:
         framework = " framework=ultralytics" if "ultralytics" in type(model).__module__ else ""
         raise TrainPoolError(f"TRAINPOOL_UNSUPPORTED_GRAPH:{framework} {error}") from error
@@ -177,10 +183,26 @@ def _activate_model(model, requested_device):
                 raise TrainPoolError(
                     "TRAINPOOL_NO_CUDA: transparent FULL mode must run on the selected primary GPU node"
                 )
+        if not test_cpu:
+            assignment = store.plan["gpu_assignments"][0]
+            eligible = [
+                i
+                for i in range(torch.cuda.device_count())
+                if str(torch.cuda.get_device_properties(i).uuid).removeprefix("GPU-").lower()
+                == assignment["gpu_id"].removeprefix("GPU-").lower()
+            ]
+            if not eligible:
+                raise TrainPoolError("TRAINPOOL_NO_CUDA: selected primary GPU is not visible to PyTorch")
+            index = eligible[0]
+            if requested_device.index is not None and requested_device.index != index:
+                raise TrainPoolError("TRAINPOOL_NO_CUDA: requested device differs from selected primary GPU")
+            torch.cuda.set_device(index)
+            actual_device = torch.device("cuda", index)
         budget = None if test_cpu else store.plan["gpu_assignments"][0]["usable_bytes"]
         with _internal_movement():
-            runtime = prepare_model_inplace(
+            runtime = prepare_graph_inplace(
                 model,
+                graph=graph,
                 device=actual_device,
                 store=store,
                 prefetch_depth=1,
@@ -197,6 +219,7 @@ def _activate_model(model, requested_device):
     record = _ModelRecord(
         runtime,
         original_parameter_ids,
+        original_parameter_order,
         current_parameter_ids,
         placeholder_parameters,
         requested_device,
@@ -283,9 +306,7 @@ def autoinstall():
                 from .sequential import SUPPORTED_OPTIMIZERS
 
                 if type(optimizer) not in SUPPORTED_OPTIMIZERS:
-                    raise TrainPoolError(
-                        f"TRAINPOOL_UNSUPPORTED_OPTIMIZER: {type(optimizer).__name__}"
-                    )
+                    raise TrainPoolError(f"TRAINPOOL_UNSUPPORTED_OPTIMIZER: {type(optimizer).__name__}")
 
         torch.nn.Module.to = module_to
         torch.nn.Module.cuda = module_cuda

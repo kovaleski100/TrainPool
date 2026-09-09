@@ -198,6 +198,13 @@ pub struct LogicalTrainingMemory {
     pub usable_vram: u64,
     pub allocated_vram: u64,
     pub logical_training_capacity: u64,
+    pub cluster_physical_vram: u64,
+    pub cluster_usable_vram: u64,
+    pub primary_gpu_physical_vram: u64,
+    pub primary_gpu_usable_vram: u64,
+    pub pool_ram_owned: u64,
+    pub current_job_backing_capacity: u64,
+    pub current_job_remaining_capacity: u64,
     pub disk_spill: bool,
 }
 impl LogicalTrainingMemory {
@@ -205,9 +212,11 @@ impl LogicalTrainingMemory {
         let mut m = Self::default();
         for n in nodes {
             m.physical_ram += n.memory.physical_ram_total;
-            m.pool_ram_budget += n.memory.trainpool_ram_budget;
-            m.pool_ram_allocatable += n.memory.trainpool_ram_available;
-            m.allocated_ram += n.memory.trainpool_ram_used;
+            if n.runtime.ram_provider {
+                m.pool_ram_budget += n.memory.trainpool_ram_budget;
+                m.pool_ram_allocatable += n.memory.trainpool_ram_available;
+                m.allocated_ram += n.memory.trainpool_ram_used;
+            }
             for g in &n.gpus {
                 m.physical_vram += g.vram_total;
                 m.free_vram += g.vram_free;
@@ -215,7 +224,33 @@ impl LogicalTrainingMemory {
                 m.allocated_vram += g.trainpool_allocated_vram;
             }
         }
-        m.logical_training_capacity = m.pool_ram_allocatable + m.usable_vram;
+        m.cluster_physical_vram = m.physical_vram;
+        m.cluster_usable_vram = m.usable_vram;
+        m.pool_ram_owned = m.allocated_ram;
+        let primary = nodes
+            .iter()
+            .filter(|n| n.runtime.gpu_compute)
+            .flat_map(|n| {
+                n.gpus
+                    .iter()
+                    .filter(|g| g.usable_vram > 0)
+                    .map(move |g| (n, g))
+            })
+            .min_by(|(an, a), (bn, b)| {
+                b.usable_vram
+                    .cmp(&a.usable_vram)
+                    .then(a.uuid.cmp(&b.uuid))
+                    .then(an.node_id.cmp(&bn.node_id))
+            });
+        if let Some((_, gpu)) = primary {
+            m.primary_gpu_physical_vram = gpu.vram_total;
+            m.primary_gpu_usable_vram = gpu.usable_vram;
+        }
+        // Snapshot for a new single-GPU job. Owned RAM is already inside budget.
+        m.current_job_backing_capacity = m.primary_gpu_usable_vram + m.pool_ram_budget;
+        m.current_job_remaining_capacity = m.primary_gpu_usable_vram + m.pool_ram_allocatable;
+        // Retain the old wire field, with corrected remaining-capacity semantics.
+        m.logical_training_capacity = m.current_job_remaining_capacity;
         m
     }
 }
