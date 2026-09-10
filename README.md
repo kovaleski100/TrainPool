@@ -129,6 +129,12 @@ Human-readable CLI output uses familiar decimal units (`KB`, `MB`, `GB`, `TB`,
 base 1000) and automatically selects the appropriate size. JSON output keeps raw
 byte counts for compatibility; options explicitly named `--*-mib` remain binary MiB.
 
+Runtime residency follows `VRAM > compute-node RAM > remote-node RAM`. The SDK keeps
+eligible training state in VRAM up to the adaptive safe budget, evicts distant-use
+values to local RAM first, and consults remote cost/capacity only after local RAM is
+unavailable. Defaults reserve at least 96 MiB, 2% of VRAM up to 256 MiB; real CUDA
+free memory is rechecked before group execution.
+
 ### Cluster inspection
 
 Default ports: TCP 7432 for framed control/data connections, UDP multicast

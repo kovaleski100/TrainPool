@@ -29,8 +29,7 @@ def test_cuda_unet_buffers_rng_gradients_and_updates(optimizer_type):
     baseline.cuda()
     baseline_optimizer = optimizer_type(baseline.parameters(), lr=0.001, foreach=False)
     client = Client(os.environ["TRAINPOOL_CUDA_ADDRESS"])
-    remote = next(node["node_id"] for node in client.status["nodes"] if node["node_id"] != client.local_node)
-    with TensorStore(client, preferred_node=remote) as store:
+    with TensorStore(client) as store:
         runtime = prepare_graph_inplace(
             model,
             device=torch.device("cuda", 0),
@@ -64,6 +63,9 @@ def test_cuda_unet_buffers_rng_gradients_and_updates(optimizer_type):
             for name, value in model.state_dict().items():
                 torch.testing.assert_close(value, baseline.state_dict()[name].cpu(), rtol=1e-5, atol=1e-6)
         metrics = client.control("metrics")["jobs"][store.job_id]
-        assert metrics["bytes_local_to_remote_ram"] > 0
-        assert metrics["bytes_remote_ram_to_local"] > 0
+        assert metrics["peak_vram_resident_bytes"] > 0
+        assert metrics["current_vram_resident_bytes"] > 0
+        assert metrics["current_local_ram_backing_bytes"] == 0
+        assert metrics["current_remote_ram_backing_bytes"] == 0
+        assert metrics["gpu_to_remote_bytes"] == 0
         assert metrics["peak_gpu_residency"] > 0

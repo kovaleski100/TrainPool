@@ -15,7 +15,7 @@ pub fn node(id: u128, ram_gib: u64, gpu_gib: Option<u64>) -> NodeCapabilities {
                 model: "mock NVIDIA".into(),
                 vram_total: size * GIB,
                 vram_free: size * GIB,
-                usable_vram: size * GIB - 512 * 1024 * 1024,
+                usable_vram: size * GIB - 96 * 1024 * 1024,
                 ..Default::default()
             }]
         })

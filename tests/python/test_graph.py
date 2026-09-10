@@ -246,11 +246,17 @@ def test_checkpoint_roundtrip_continues_training_and_rejects_bad_load(optimizer_
 def test_admission_splits_groups_and_rejects_impossible_operator():
     model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 4))
     store = SimulationStore()
-    runtime = prepare_graph_inplace(model, device=torch.device("cpu"), store=store, gpu_budget_bytes=10000)
+    budget = 2400
+    runtime = prepare_graph_inplace(model, device=torch.device("cpu"), store=store, gpu_budget_bytes=budget)
     x = torch.randn(16, 4)
     model(x).sum().backward()
     assert len(runtime.ir.groups) > 1
-    assert all(group.estimated_working_set <= 10000 for group in runtime.ir.groups)
+    assert all(group.estimated_working_set <= budget for group in runtime.ir.groups)
+    assert all(
+        group.estimated_working_set
+        == max(group.forward_peak, group.backward_peak, group.optimizer_peak) + group.workspace_margin
+        for group in runtime.ir.groups
+    )
     model.close()
     model = nn.Sequential(nn.Linear(4, 4))
     store = SimulationStore()

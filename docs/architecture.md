@@ -31,8 +31,8 @@ intermediate hop solely because it is leader.
   capacity-aware stage assignments.
 * `runtime`: dispatch, membership exchange, pressure handling and services sharing one
   process. No remote execution endpoint exists.
-* `python/trainpool_torch`: local SDK, tensor table, saved-tensor hooks, graph and sequential
-  recomputation, remote optimizer state and bounded prefetch.
+* `python/trainpool_torch`: local SDK, tier-aware tensor table, saved-tensor hooks,
+  graph and sequential recomputation, next-use eviction and bounded prefetch.
 
 The one executable includes daemon and CLI commands. `run` launches a structured
 local program/argument vector with inherited working directory/environment using
@@ -89,9 +89,17 @@ remote Python workers and data parallelism are not implemented.
 
 Transparent Python execution captures a DAG, groups adjacent operations while
 preserving boundary dependencies, and uses metadata admission to split oversized
-groups. Parameters, buffers, forward boundaries and accumulated gradients are backed
-by the existing fabric. See [adapter semantics](pytorch.md) for recomputation,
+groups. The SDK uses a strict residency hierarchy: selected GPU VRAM, compute-node
+RAM, then remote-node RAM. State remains in VRAM while it fits the adaptive safe
+budget. Under pressure, GraphIR next-use/liveness metadata ranks eviction candidates;
+the daemon allocates evicted blocks locally before considering topology-ranked peers.
+Promotion and eviction transfer ownership between tiers instead of retaining a
+permanent backing replica. See [adapter semantics](pytorch.md) for recomputation,
 BatchNorm/RNG correctness, checkpoints and current limitations.
+
+GPU locations remain identified by `(node_id, gpu_id)`. V1 selects one such pair,
+but the residency interfaces do not prevent a future planner from assigning groups
+to different pairs.
 
 Cluster VRAM sums are inventory. New-job logical backing capacity is primary GPU
 usable VRAM plus the pool RAM budget. Remaining logical capacity uses allocatable RAM

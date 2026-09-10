@@ -19,7 +19,7 @@ use trainpool::{
     scheduler::{
         placement::{CapacityPlacement, PlacementPolicy},
         planner::{CapacityPlanner, StageSpec, TrainingPlanner, require_cuda},
-        topology::Topology,
+        topology::{LinkEstimate, Topology},
     },
     transport::{signature, verify},
 };
@@ -64,6 +64,33 @@ fn cpu_only_leader_and_single_gpu_plan() {
     let ranked = CapacityPlacement.rank_ram(&nodes, nodes[0].node_id, GIB, &Topology::default());
     assert_eq!(ranked[0].node_id, nodes[0].node_id);
     assert!(ranked.iter().any(|n| n.node_id == nodes[1].node_id));
+}
+
+#[test]
+fn local_ram_is_a_strict_tier_and_remote_peers_follow_link_cost() {
+    let nodes = vec![node(1, 32, Some(12)), node(2, 64, None), node(3, 64, None)];
+    let compute = nodes[0].node_id;
+    let mut topology = Topology::default();
+    topology.update(LinkEstimate {
+        source: compute,
+        destination: nodes[1].node_id,
+        latency_ms: 20.0,
+        bytes_per_second: Some(100_000_000.0),
+        sampled_at_ms: 1,
+        active_transfers: 0,
+    });
+    topology.update(LinkEstimate {
+        source: compute,
+        destination: nodes[2].node_id,
+        latency_ms: 1.0,
+        bytes_per_second: Some(1_000_000_000.0),
+        sampled_at_ms: 1,
+        active_transfers: 0,
+    });
+    let ranked = CapacityPlacement.rank_ram(&nodes, compute, GIB, &topology);
+    assert_eq!(ranked[0].node_id, compute);
+    assert_eq!(ranked[1].node_id, nodes[2].node_id);
+    assert_eq!(ranked[2].node_id, nodes[1].node_id);
 }
 #[test]
 fn unequal_gpu_stages_obey_working_set_capacity() {
@@ -131,6 +158,8 @@ fn configuration_and_identity_are_safe() {
     assert_eq!(node_id(dir.path()).unwrap(), node_id(dir.path()).unwrap());
     let mut config = Config::default();
     assert_eq!(config.ram_fraction, 0.50);
+    assert_eq!(config.vram_reserve_bytes, 96 * 1024 * 1024);
+    assert_eq!(config.vram_reserve_fraction, 0.02);
     assert!(!config.disk.enabled);
     for fraction in [0.09, 0.91, f64::NAN] {
         config.ram_fraction = fraction;
@@ -142,6 +171,24 @@ fn configuration_and_identity_are_safe() {
     assert_eq!(
         usable_vram(12 * GIB, 500 * 1024 * 1024, 512 * 1024 * 1024, 0.05),
         0
+    );
+    assert_eq!(
+        usable_vram(
+            4 * GIB,
+            4 * GIB,
+            config.vram_reserve_bytes,
+            config.vram_reserve_fraction
+        ),
+        4 * GIB - 96 * 1024 * 1024
+    );
+    assert_eq!(
+        usable_vram(
+            32 * GIB,
+            32 * GIB,
+            config.vram_reserve_bytes,
+            config.vram_reserve_fraction
+        ),
+        32 * GIB - 256 * 1024 * 1024
     );
 }
 #[test]

@@ -126,7 +126,7 @@ impl TrainingPlanner for CapacityPlanner {
                 .filter(|n| n.runtime.ram_provider)
                 .map(|n| n.node_id)
                 .collect(),
-            tensor_placement_policy: "local-ram-then-transfer-cost".into(),
+            tensor_placement_policy: "vram-then-local-ram-then-remote-cost".into(),
             topology: topology.clone(),
             memory_budgets: nodes
                 .iter()

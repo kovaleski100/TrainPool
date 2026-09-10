@@ -52,8 +52,10 @@ impl Default for Config {
             ram_limit_bytes: None,
             chunk_bytes: (64 * MIB) as usize,
             lease_seconds: 300,
-            vram_reserve_bytes: 512 * MIB,
-            vram_reserve_fraction: 0.05,
+            // A small non-zero floor protects CUDA context/workspaces on small
+            // GPUs; the fractional component grows adaptively on larger cards.
+            vram_reserve_bytes: 96 * MIB,
+            vram_reserve_fraction: 0.02,
             disk: DiskConfig::default(),
         }
     }

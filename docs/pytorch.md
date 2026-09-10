@@ -18,10 +18,11 @@ splits it and repeats admission. A single operator that still exceeds the estima
 fails with `TRAINPOOL_UNSUPPORTED_WORKING_SET` before tensor restoration.
 
 Forward executes one group at a time under no-grad with `torch.func.functional_call`.
-Only its parameters, buffers and inputs are restored. All tensor boundaries,
-including skips needed by later decoder groups, are offloaded immediately. Local
+Only its parameters, buffers and inputs are materialized for execution. Tensor
+boundaries, including skips needed by later decoder groups, remain VRAM-resident
+when safe capacity permits; otherwise they move to local and then remote RAM. Local
 intermediates remain ordinary PyTorch tensors within the group. Tensor payloads use
-independent fabric handles; tuple/list/dict/ordered-mapping metadata stays inside
+independent handles; tuple/list/dict/ordered-mapping metadata stays inside
 the process and is not pickled or sent as executable Python objects.
 
 Backward visits the DAG in reverse topological group order. It restores the required
@@ -50,9 +51,10 @@ operations are rejected. Safe leaf activations are executed without in-place mut
 
 ## Optimizers and checkpoints
 
-SGD, Adam and AdamW use the existing capacity optimizer, restoring one execution
+SGD, Adam and AdamW use the existing capacity optimizer, processing one execution
 group at a time. No update begins until DAG backward has completed. Parameters,
-gradients and tensor-valued optimizer state return to RAM. Multiple parameter groups,
+gradients and tensor-valued optimizer state remain eligible for VRAM and fall through
+to local/remote backing only under pressure. Multiple parameter groups,
 optimizer closures, populated optimizers at initial interception, capturable, fused
 and differentiable optimizers are explicitly unsupported. Scheduler changes to the
 supported group's options are read on each step.
@@ -81,17 +83,20 @@ CUDA movement checks both the selected node and GPU UUID. If CUDA is unavailable
 `TRAINPOOL_NO_CUDA` is emitted. There is no CPU fallback. `TRAINPOOL_TEST_CPU=1` is
 only the transparent numerical-test backend, explicitly reported as `test-cpu`.
 
-Shape admission runs metadata kernels, accounting conservatively for parameters,
-buffers, all group intermediates, gradients and workspace headroom. Available CUDA
+Shape admission runs metadata kernels and records separate forward, backward and
+per-parameter optimizer peaks. It admits the largest simultaneous phase plus
+workspace headroom instead of multiplying all state classes as concurrently live. Available CUDA
 memory is checked again before restoring a group. Backend-dependent CUDA workspace
 allocation can still fail; such failures are reported as
 `TRAINPOOL_UNSUPPORTED_WORKING_SET`, never retried by materializing the full model or
 running CPU kernels. **These estimates are not an allocator-enforced CUDA limit.**
 Physical peak residency and actual workspace behavior remain hardware release gates.
 
-Graph execution uses deterministic demand restoration. It does not concurrently
-prefetch another group's GPU parameters. The explicit Sequential API retains its
-optional one-worker look-ahead prefetch, with `prefetch_depth=0/1`.
+Graph execution uses deterministic demand restoration and next-use/liveness-aware
+eviction. Large values with distant next use are preferred over near-use, frequently
+reused or transfer-expensive values. The explicit Sequential API retains its optional
+one-worker look-ahead prefetch, with `prefetch_depth=0/1`; graph prefetch remains a
+future overlap optimization.
 
 The default tensor block size is at most 4 MiB, independently of 64 KiB host staging
 pieces. Upload/download streaming verifies chunk and complete-block checksums. This

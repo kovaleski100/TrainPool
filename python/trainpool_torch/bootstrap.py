@@ -231,7 +231,7 @@ def _activate_model(model, requested_device):
         _attach_optimizer(optimizer)
     print(
         f"[TrainPool] compatibility=FULL backend={'test-cpu' if test_cpu else requested_device} "
-        "parameters=remote activations=recomputed gradients=remote optimizer_state=remote",
+        "residency=VRAM>local-RAM>remote-RAM activations=recomputed eviction=next-use",
         file=sys.stderr,
     )
     return model

@@ -46,9 +46,9 @@ pytest -q
 python scripts/two_node_demo.py
 ```
 
-The final CPU suite passed **37 tests**, with 3 opt-in CUDA tests skipped; Rust
-passed **22 tests** (5 runtime/CLI,
-14 core, 3 fabric). Formatting, Clippy with warnings denied, release build and the
+The final CPU suite passed **44 tests**, with 3 opt-in CUDA tests skipped; Rust
+passed **24 tests** (6 runtime/CLI,
+15 core, 3 fabric). Formatting, Clippy with warnings denied, release build and the
 release-binary two-node demo passed. Physical CUDA tests are opt-in and skipped in
 CPU CI unless an explicit CUDA fabric endpoint is supplied.
 
@@ -72,6 +72,11 @@ of payload, 9 MiB of remote writes and reads, both directed topology links, lead
 loss/re-election, explicit lost-block errors, and zero tensor files.
 
 Python coverage includes:
+
+- Deterministic tier cases for VRAM only, VRAM plus local RAM, and all three tiers.
+- Two remote providers ranked after local RAM using link cost, and next-use eviction
+  that removes a large distant value before a near-use value.
+- Phase-specific admission peaks and adaptive 4 GiB / 32 GiB reserve calculations.
 
 - Actual encoder/decoder U-Net with skip connections, two concatenations, BatchNorm,
   pooling, ConvTranspose, functional interpolation and Dropout.
@@ -114,6 +119,31 @@ support sensitivity to rounding amplified through BatchNorm and AdamW, rather th
 establishing general float32 parity. The broader numerical limitation remains explicit.
 
 ## Physical CUDA checks on a local fabric
+
+### Tier-policy validation (2026-09-10)
+
+A current-source daemon was started on an isolated port without restarting the
+existing service. The physical RTX 3050 reported 3,951,296,512 CUDA bytes and the
+adaptive daemon budget was 3,835,691,008 bytes. `scripts/validate_residency.py`
+observed:
+
+| Case | VRAM resident peak | Local RAM backing peak | Remote RAM backing peak |
+|---|---:|---:|---:|
+| A — VRAM only | 67,108,864 | 0 | 0 |
+| B — VRAM + local | 3,825,205,248 | 67,108,864 | 0 |
+| C — all tiers | 3,835,691,008 | 535,822,336 | 1,048,576 |
+
+Case B recorded one next-use eviction; case C recorded eight. Three physical CUDA
+U-Net parity tests (SGD, Adam and AdamW) passed with zero RAM backing for the small
+model. A public-launcher DeepLabV3/ResNet50 AdamW step also passed, peaking at
+832,856,576 allocated CUDA bytes and 587,519,396 TrainPool-resident bytes, with no
+RAM backing.
+
+The third-tier endpoint was logically distinct but advertised the same hostname,
+GPU UUID and local address as the compute host. Therefore case C validates tier
+selection, metrics and transport, but is **not** evidence of an independently
+identified physical remote machine. Correct the peer's copied advertise/identity
+configuration before closing the separate-machine release gate.
 
 Executed on the RTX 3050 outside the sandbox with PyTorch 2.14.0+cu130 and
 torchvision 0.29.0+cu130: **3 CUDA parity tests passed**, covering two U-Net steps
@@ -265,6 +295,11 @@ trainpool --address 127.0.0.1:7432 python tests/models/deeplab_stress.py \
 residency and compute load. The target is an estimate, not a quota; monitor both
 hosts and stop the foreground process with Ctrl-C if thermal, swap or network pressure
 is excessive. No tensor data or checkpoints are written to disk.
+
+The stress output includes current/peak VRAM, local backing, remote backing, eviction
+and prefetch metrics. A three-tier physical run should first verify a small workload
+with zero backing, then exceed VRAM while remaining within local RAM, and finally
+exceed both local tiers to observe remote backing.
 
 ## Release gates still open
 

@@ -18,7 +18,9 @@ pub struct GpuCapabilities {
 }
 
 pub fn usable_vram(total: u64, free: u64, reserve: u64, fraction: f64) -> u64 {
-    free.saturating_sub(reserve.max((total as f64 * fraction) as u64))
+    const ADAPTIVE_RESERVE_CAP: u64 = 256 * MIB;
+    let adaptive = ((total as f64 * fraction) as u64).min(ADAPTIVE_RESERVE_CAP);
+    free.saturating_sub(reserve.max(adaptive))
 }
 
 /// nvidia-smi is optional; no driver is linked into the runtime.

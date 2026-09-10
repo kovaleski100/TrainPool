@@ -66,6 +66,7 @@ impl Runtime {
                         let mut metrics = self.metrics.lock().await;
                         let m = metrics.job(h.job_id);
                         m.bytes_local_to_remote_ram += length as u64;
+                        m.local_to_remote_bytes += length as u64;
                         m.network_wait_ms += start.elapsed().as_secs_f64() * 1000.0;
                     }
                     return write_frame(stream, &response).await;
@@ -146,6 +147,7 @@ impl Runtime {
                         let mut metrics = self.metrics.lock().await;
                         let m = metrics.job(h.job_id);
                         m.bytes_remote_ram_to_local += length as u64;
+                        m.remote_to_local_bytes += length as u64;
                         m.network_wait_ms += start.elapsed().as_secs_f64() * 1000.0;
                     }
                     return Ok(());

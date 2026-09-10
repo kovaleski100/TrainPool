@@ -63,7 +63,7 @@ The authoritative schema is [`src/protocol/mod.rs`](../src/protocol/mod.rs).
 | `register`, `publish` | Metadata updates / migration commit and publication |
 | `memory_pressure`, `migrate` | Request migration and instruct direct source-to-destination copy |
 | `reserve_staging`, `release_staging` | Account for a bounded SDK host buffer |
-| `metrics`, `report_metrics` | Local per-job counters and SDK CUDA/prefetch reports |
+| `metrics`, `report_metrics` | Local per-job counters plus SDK tier residency, directional transfer, eviction and prefetch reports |
 | `topology`, `benchmark`, `measure`, `probe` | Directed topology and explicit bounded bulk probes |
 
 Responses contain `ok`, `data`, and `error`. Metadata payloads are JSON. Control requests

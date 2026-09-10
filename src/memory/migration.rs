@@ -138,6 +138,7 @@ pub async fn migrate(
     let m = metrics.job(handle.job_id);
     m.tensor_migrations += 1;
     m.bytes_local_to_remote_ram += handle.size;
+    m.local_to_remote_bytes += handle.size;
     m.migration_latency_ms += start.elapsed().as_secs_f64() * 1000.0;
     tracing::info!(block_id = %handle.id, source = %runtime.node_id, %destination, bytes = handle.size, "RAM migration committed");
     Ok(committed)

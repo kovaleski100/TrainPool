@@ -65,6 +65,12 @@ memory from two processes on the same machine must not be counted as two real ho
 | `prefetch_hits` / `prefetch_misses` | Whether a predicted stage was ready on consumption |
 | `gpu_wait_for_data_ms` | Foreground CUDA data restore/prefetch wait wall time |
 | `peak_gpu_residency` / `current_gpu_residency` | SDK-reported PyTorch process allocator observations |
+| `peak_vram_resident_bytes` / `current_vram_resident_bytes` | Exact TrainPool handle ownership retained in the selected GPU tier |
+| `peak_local_ram_backing_bytes` / `current_local_ram_backing_bytes` | SDK handle bytes backed by compute-node RAM |
+| `peak_remote_ram_backing_bytes` / `current_remote_ram_backing_bytes` | SDK handle bytes backed by other RAM providers |
+| `gpu_to_local_bytes`, `local_to_gpu_bytes`, `gpu_to_remote_bytes`, `remote_to_gpu_bytes` | Directional movement across GPU/RAM tier boundaries |
+| `remote_to_local_bytes` / `local_to_remote_bytes` | Network staging and RAM migration directions |
+| `eviction_count` / `prefetch_count` | Residency evictions and scheduled bounded prefetch attempts |
 | `peak_ram_residency` / `current_ram_residency` | Per-job payload RAM ownership on this node, released with the last live allocation reference |
 | `ram_pressure_events` | Local pressure samples affecting that job |
 | `failed_transfers` | Explicit migration copy failures (connection failures are also logged) |

@@ -104,7 +104,10 @@ pub struct TcpTransport {
 impl Transport for TcpTransport {
     type Stream = TcpStream;
     async fn connect(&self, address: SocketAddr) -> Result<TcpStream> {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        // Authentication can contend with model execution and batched lease
+        // renewal on CPU-only workers.  Five seconds was short enough for a
+        // healthy peer to be mistaken for a failed one during DeepLab stress.
+        tokio::time::timeout(Duration::from_secs(30), async {
             let mut stream = TcpStream::connect(address).await?;
             stream.set_nodelay(true)?;
             let challenge: Challenge = read_frame(&mut stream).await?;

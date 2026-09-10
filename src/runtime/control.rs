@@ -97,6 +97,26 @@ impl Runtime {
                 m.gpu_wait_for_data_ms += metrics.gpu_wait_for_data_ms;
                 m.peak_gpu_residency = m.peak_gpu_residency.max(metrics.peak_gpu_residency);
                 m.current_gpu_residency = metrics.current_gpu_residency;
+                m.peak_vram_resident_bytes = m
+                    .peak_vram_resident_bytes
+                    .max(metrics.peak_vram_resident_bytes);
+                m.current_vram_resident_bytes = metrics.current_vram_resident_bytes;
+                m.peak_local_ram_backing_bytes = m
+                    .peak_local_ram_backing_bytes
+                    .max(metrics.peak_local_ram_backing_bytes);
+                m.current_local_ram_backing_bytes = metrics.current_local_ram_backing_bytes;
+                m.peak_remote_ram_backing_bytes = m
+                    .peak_remote_ram_backing_bytes
+                    .max(metrics.peak_remote_ram_backing_bytes);
+                m.current_remote_ram_backing_bytes = metrics.current_remote_ram_backing_bytes;
+                m.gpu_to_local_bytes += metrics.gpu_to_local_bytes;
+                m.local_to_gpu_bytes += metrics.local_to_gpu_bytes;
+                m.gpu_to_remote_bytes += metrics.gpu_to_remote_bytes;
+                m.remote_to_gpu_bytes += metrics.remote_to_gpu_bytes;
+                m.remote_to_local_bytes += metrics.remote_to_local_bytes;
+                m.local_to_remote_bytes += metrics.local_to_remote_bytes;
+                m.eviction_count += metrics.eviction_count;
+                m.prefetch_count += metrics.prefetch_count;
                 m.gpu_id = metrics.gpu_id.clone();
                 drop(all);
                 if let Some(id) = metrics.gpu_id {

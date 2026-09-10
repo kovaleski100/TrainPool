@@ -159,12 +159,21 @@ class SequentialRuntime:
             raise TypeError("Sequential MVP accepts floating-point inputs")
         if self.gpu_budget_bytes:
             largest = max((sum(h.size for h in s.weights.values()) for s in self.stages), default=0)
-            # Conservative admission estimate; actual operator workspaces still must fit.
-            required = 6 * largest + 3 * value.numel() * value.element_size()
+            activation = value.numel() * value.element_size()
+            forward_peak = largest + 2 * activation
+            backward_peak = 2 * largest + 3 * activation
+            optimizer_peak = 5 * max(
+                (h.size for stage in self.stages for h in stage.weights.values()), default=0
+            )
+            workspace = max(largest, activation) // 10
+            required = max(forward_peak, backward_peak, optimizer_peak) + workspace
             if required > self.gpu_budget_bytes:
                 raise TrainPoolError(
-                    f"TRAINPOOL_STAGE_TOO_LARGE: estimate {required} exceeds stage budget {self.gpu_budget_bytes}"
+                    f"TRAINPOOL_STAGE_TOO_LARGE: phase peak {required} exceeds stage budget "
+                    f"{self.gpu_budget_bytes}"
                 )
+            if self.device.type == "cuda":
+                self.store.ensure_cuda_capacity(required)
         if not training or not torch.is_grad_enabled():
             with torch.no_grad():
                 for index, record in enumerate(self.stages):
@@ -426,6 +435,8 @@ def build_sequential_runtime(
     gpu_budget_bytes=None,
 ):
     """Move a validated Sequential's state into the fabric and return its runtime."""
+    if device.type == "cuda":
+        store.configure_gpu(device, gpu_budget_bytes)
     records = []
     for block in model:
         named = dict(block.named_parameters())

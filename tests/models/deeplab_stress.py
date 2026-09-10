@@ -124,6 +124,14 @@ def snapshot(client, job_id, baseline_remote_used):
     remote_budget = sum(node["memory"]["trainpool_ram_budget"] for node in remotes)
     job = client.control("metrics")["jobs"].get(job_id, {})
     return {
+        "current_vram_resident_bytes": job.get("current_vram_resident_bytes", 0),
+        "peak_vram_resident_bytes": job.get("peak_vram_resident_bytes", 0),
+        "current_local_ram_backing_bytes": job.get("current_local_ram_backing_bytes", 0),
+        "peak_local_ram_backing_bytes": job.get("peak_local_ram_backing_bytes", 0),
+        "current_remote_ram_backing_bytes": job.get("current_remote_ram_backing_bytes", 0),
+        "peak_remote_ram_backing_bytes": job.get("peak_remote_ram_backing_bytes", 0),
+        "eviction_count": job.get("eviction_count", 0),
+        "prefetch_count": job.get("prefetch_count", 0),
         "remote_ram_used_mib": round(remote_used / MIB, 2),
         "remote_ram_delta_mib": round(max(0, remote_used - baseline_remote_used) / MIB, 2),
         "remote_ram_budget_mib": round(remote_budget / MIB, 2),

@@ -202,6 +202,7 @@ def test_remote_allocations_survive_lease_renewal_and_prefetch(cluster):
         try:
             prefetch.schedule("held", lambda: store.restore(held))
             torch.testing.assert_close(prefetch.take("held", lambda: store.restore(held)), value)
+            assert store.metrics["prefetch_count"] == 1
         finally:
             prefetch.close()
         assert len(store.tensors) == 1

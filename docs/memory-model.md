@@ -47,11 +47,13 @@ for relays. This is minimum deadlock-avoidance headroom, not a promise that any 
 of concurrent SDK staging requests will fit. Select a chunk/block size substantially
 below the local contribution ceiling.
 
-The SDK offloads a contiguous tensor by copying one bounded slice to CPU at a time,
-reserving that host buffer, streaming it, then releasing staging. Restoring a CUDA
-tensor allocates its destination on the GPU and fills it one checked host chunk at a
-time. Synchronous CPU/GPU copies keep staging alive until copies finish. Look-ahead
-uses a worker thread to overlap the next stage's network/copy work with execution.
+The SDK first attempts to retain a contiguous tensor in selected-device VRAM. When
+the safe VRAM budget is full it evicts low-value residents, copying one bounded slice
+to CPU at a time, reserving that host buffer, streaming it, then releasing staging.
+The allocator fills compute-node RAM before any remote provider. Restoring a backed
+CUDA tensor uses checked host chunks and promotes it to VRAM when useful; successful
+promotion releases the RAM blocks, so it is a move rather than replication. The
+bounded worker prefetch can overlap the next sequential stage's transfer with compute.
 
 Non-contiguous tensors are normalized with PyTorch `contiguous()` before transfer;
 that normalization can itself require a tensor-sized allocation on the original
@@ -61,11 +63,14 @@ The SDK cannot make a single operation whose working set exceeds every GPU execu
 ## GPU resource class
 
 ```
-reserve = max(512 MiB, 0.05 * physical_vram_total)
+adaptive = min(0.02 * physical_vram_total, 256 MiB)
+reserve = max(96 MiB, adaptive)
 usable_vram = max(0, current_free_vram - reserve)
 ```
 
-Both reserve terms are configurable. Status distinguishes physical, free, usable and
+Both reserve terms are configurable; an explicitly larger byte floor is not capped.
+The SDK additionally checks `torch.cuda.mem_get_info()` before promotion and group
+execution, allowing observed pressure to trigger eviction. Status distinguishes physical, free, usable and
 SDK-reported allocated VRAM. The SDK uses explicit tensor copies and PyTorch CUDA
 allocation; the Rust block store never claims to allocate a distributed CUDA pointer.
 GPU observations are refreshed about every ten seconds. SDK GPU allocation reports
@@ -75,14 +80,15 @@ compute process and are not a cross-process ownership measurement.
 ## Placement and pressure
 
 RAM candidates must advertise provider capability, enough allocatable bytes and no
-current pressure. Local RAM is preferred, followed by remote estimated transfer time:
+current pressure. Local RAM is a strict tier boundary, followed by remote estimated
+transfer time:
 
 ```
 latency + bytes / estimated_bandwidth
 ```
 
-The heuristic increases remote cost for reported active transfer load and uses UUIDs
-for deterministic ties. Capacity is rechecked at the owner, so stale announcements
+The remote heuristic increases cost for active transfer load, prefers available
+capacity on equal cost and uses UUIDs for deterministic ties. Capacity is rechecked at the owner, so stale announcements
 cannot bypass the local RAM budget. Failed candidates are tried in ranked order;
 explicit `preferred_node` intentionally pins placement to that provider.
 
@@ -132,3 +138,10 @@ selected GPU; inventory refresh does not migrate computation.
 The old `logical_training_capacity` JSON field remains a compatibility alias for
 the corrected remaining capacity. Old `physical_vram` / `usable_vram` fields remain
 inventory aliases. No other GPU's VRAM enters the executable capacity calculation.
+
+## Residency observability
+
+Per-job metrics expose current and peak TrainPool-owned bytes for VRAM, local RAM
+backing and remote RAM backing. Directional counters distinguish GPU/local,
+GPU/remote and local/remote traffic. `eviction_count` and `prefetch_count` expose
+policy actions; existing allocator and network counters remain for compatibility.

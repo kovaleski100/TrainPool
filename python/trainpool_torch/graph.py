@@ -145,6 +145,10 @@ class Group:
     outputs: tuple
     nodes: tuple
     estimated_working_set: int = 0
+    forward_peak: int = 0
+    backward_peak: int = 0
+    optimizer_peak: int = 0
+    workspace_margin: int = 0
 
 
 @dataclass
@@ -228,7 +232,7 @@ def partition(graph, budget=None, max_nodes=12):
         if node.op == "call_module":
             module = graph.get_submodule(node.target)
             node_size = sum(p.numel() * p.element_size() for p in module.parameters())
-        if chunk and (len(chunk) >= max_nodes or (budget and 8 * (size + node_size) > budget // 2)):
+        if chunk and (len(chunk) >= max_nodes or (budget and 3 * (size + node_size) > budget)):
             chunks.append(chunk)
             chunk, size = [], 0
         chunk.append(node)
@@ -373,17 +377,17 @@ class GraphRuntime(SequentialRuntime):
         self.records = {}
         self.state_names = tuple(model.state_dict())
         self.owner = model  # Replaced by a weak reference after installation.
-        for group in self.ir.groups:
+        if self.device.type == "cuda":
+            self.store.configure_gpu(self.device, budget)
+        for index, group in enumerate(self.ir.groups):
             named = dict(group.module.named_parameters())
             buffers = dict(group.module.named_buffers())
             record = _Stage(
                 group.module,
-                {name: store.offload(p, expected_next_use="forward") for name, p in named.items()},
+                {name: store.offload(p, expected_next_use=index) for name, p in named.items()},
                 {name for name, p in named.items() if p.requires_grad},
             )
-            record.buffers = {
-                name: store.offload(b, expected_next_use="forward") for name, b in buffers.items()
-            }
+            record.buffers = {name: store.offload(b, expected_next_use=index) for name, b in buffers.items()}
             self.stages.append(record)
             for name in named:
                 self.records[name] = record
@@ -477,9 +481,38 @@ class GraphRuntime(SequentialRuntime):
             raise TrainPoolError(
                 f"TRAINPOOL_UNSUPPORTED_WORKING_SET: metadata at {group.nodes}: {error}"
             ) from error
-        # Include local autograd, gradients, optimizer temporaries and workspace headroom.
-        required = 8 * sum(h.size for h in record.weights.values()) + 8 * interpreter.total
-        required += 4 * sum(h.size for h in record.buffers.values())
+        nodes = list(interpreter.module.graph.nodes)
+        positions = {node: index for index, node in enumerate(nodes)}
+        last_use = {
+            node.name: max((positions[user] for user in node.users), default=positions[node])
+            for node in nodes
+        }
+        live_sizes = {}
+        activation_peak = 0
+        for index, node in enumerate(nodes):
+            if node.op != "output":
+                live_sizes[node.name] = interpreter.sizes.get(node.name, 0)
+            activation_peak = max(activation_peak, sum(live_sizes.values()))
+            for name in tuple(live_sizes):
+                if last_use[name] <= index:
+                    live_sizes.pop(name)
+
+        parameter_bytes = sum(h.size for h in record.weights.values())
+        buffer_bytes = sum(h.size for h in record.buffers.values())
+        largest_parameter = max((h.size for h in record.weights.values()), default=0)
+        largest_value = max(interpreter.sizes.values(), default=0)
+        # Each phase is modeled independently because TrainPool restores and
+        # publishes state one group at a time. Backward includes recomputation
+        # plus gradients; optimizer state is processed parameter by parameter.
+        group.forward_peak = parameter_bytes + buffer_bytes + activation_peak
+        group.backward_peak = 2 * parameter_bytes + buffer_bytes + 2 * activation_peak
+        group.optimizer_peak = 5 * largest_parameter
+        group.workspace_margin = max(
+            largest_value // 2,
+            (parameter_bytes + buffer_bytes + activation_peak) // 10,
+        )
+        required = max(group.forward_peak, group.backward_peak, group.optimizer_peak)
+        required += group.workspace_margin
         group.estimated_working_set = required
         for name, size in interpreter.sizes.items():
             if name in self.ir.values:
@@ -496,11 +529,14 @@ class GraphRuntime(SequentialRuntime):
                 # any live graph value. Recheck physical free bytes afterwards.
                 torch.cuda.empty_cache()
                 free, _ = torch.cuda.mem_get_info(self.device)
-            available = min(available or free, free)
+            evictable = getattr(self.store, "_resident_bytes", 0)
+            available = min(available or free + evictable, free + evictable)
         if available and required > available:
             raise TrainPoolError(
-                f"TRAINPOOL_UNSUPPORTED_WORKING_SET: {group.nodes}: estimate {required} > {available}"
+                f"TRAINPOOL_UNSUPPORTED_WORKING_SET: {group.nodes}: phase peak {required} > {available}"
             )
+        if self.device.type == "cuda":
+            self.store.ensure_cuda_capacity(required)
 
     def _repartition(self, chunks):
         weights, buffers, gradients, states, trainable = {}, {}, {}, {}, set()
@@ -608,7 +644,26 @@ class GraphRuntime(SequentialRuntime):
             for node, value in zip(self.ir.placeholders, inputs, strict=True):
                 tape["values"][node.name] = SavedTree.save(value, self.store, "forward")
             for i, (group, record) in enumerate(zip(self.ir.groups, self.stages, strict=True)):
+                access = i
+                if hasattr(self.store, "set_access_index"):
+                    access = self.store.set_access_index(i)
+                if hasattr(self.store, "update_priority"):
+                    for handle in (*record.weights.values(), *record.buffers.values()):
+                        self.store.update_priority(handle, next_use=access, remaining_consumers=1)
                 self._check_budget(group)
+                if hasattr(self.store, "update_priority"):
+                    for name in group.inputs:
+                        for handle in tape["values"][name].leaves:
+                            if isinstance(handle, TensorHandle):
+                                self.store.update_priority(
+                                    handle,
+                                    next_use=(
+                                        None
+                                        if live[name].next_use is None
+                                        else access + max(1, live[name].next_use - i)
+                                    ),
+                                    remaining_consumers=live[name].remaining_consumers,
+                                )
                 arguments = tuple(
                     tape["values"][name].restore(self.store, self.device) for name in group.inputs
                 )
@@ -642,20 +697,31 @@ class GraphRuntime(SequentialRuntime):
                     replacement = self.store.offload(state[name], expected_next_use="next forward")
                     self.store.free(record.buffers[name])
                     record.buffers[name] = replacement
+                if hasattr(self.store, "update_priority"):
+                    for handle in (*record.weights.values(), *record.buffers.values()):
+                        self.store.update_priority(
+                            handle,
+                            next_use=access + len(self.ir.groups),
+                            remaining_consumers=1,
+                        )
                 for name, value in zip(group.outputs, result, strict=True):
-                    saved = SavedTree.save(value, self.store, f"consumer:{live[name].next_use}")
+                    next_use = (
+                        None if live[name].next_use is None else access + max(1, live[name].next_use - i)
+                    )
+                    saved = SavedTree.save(value, self.store, next_use)
                     tape["values"][name] = saved
                     live[name].size = sum(h.size for h in saved.leaves if isinstance(h, TensorHandle))
-                    live[name].residency = (
-                        Residency.REMOTE_RAM
-                        if any(
-                            b["owner_node"] != self.store.client.local_node
-                            for h in saved.leaves
-                            if isinstance(h, TensorHandle)
-                            for b in h.blocks
-                        )
-                        else Residency.LOCAL_RAM
-                    )
+                    handles = [h for h in saved.leaves if isinstance(h, TensorHandle)]
+                    if any(h.resident is not None for h in handles):
+                        live[name].residency = Residency.GPU_RESIDENT
+                    elif any(
+                        block["owner_node"] != self.store.client.local_node
+                        for handle in handles
+                        for block in handle.blocks
+                    ):
+                        live[name].residency = Residency.REMOTE_RAM
+                    else:
+                        live[name].residency = Residency.LOCAL_RAM
                 for name in group.inputs:
                     live[name].remaining_consumers -= 1
                     live[name].next_use = next((j for j in live[name].consumers if j > i), None)
@@ -682,6 +748,16 @@ class GraphRuntime(SequentialRuntime):
         # A separate frame bounds tensor references (including autograd edges) to
         # this group. No previous group's local variables survive the next load.
         group, record = self.ir.groups[index], self.stages[index]
+        access = len(self.ir.groups) + (len(self.ir.groups) - index)
+        if hasattr(self.store, "set_access_index"):
+            access = self.store.set_access_index(access)
+        if hasattr(self.store, "update_priority"):
+            for handle in (*record.weights.values(), *record.buffers.values()):
+                self.store.update_priority(
+                    handle,
+                    next_use=access,
+                    remaining_consumers=1,
+                )
         args = tuple(tape["values"][name].restore(self.store, self.device) for name in group.inputs)
         args = map_tree(lambda x: x.detach().requires_grad_(x.is_floating_point()), args)
         state = self._state(record, tape["buffers"][index])
