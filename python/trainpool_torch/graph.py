@@ -461,7 +461,12 @@ class GraphRuntime(SequentialRuntime):
                 self.sizes[node.name] = sum(
                     x.numel() * x.element_size() for x in leaves if isinstance(x, torch.Tensor)
                 )
-                self.total += self.sizes[node.name]
+                # Placeholders and the region output alias tensors that are already
+                # represented by operator results. Counting them again makes a
+                # single-node region appear to need roughly three times its real
+                # activation storage and can reject otherwise admissible operators.
+                if node.op.startswith("call_") or node.op == "get_attr":
+                    self.total += self.sizes[node.name]
                 return result
 
         meta = map_tree(lambda x: torch.empty_like(x, device="meta"), args)

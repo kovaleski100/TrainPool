@@ -246,11 +246,11 @@ def test_checkpoint_roundtrip_continues_training_and_rejects_bad_load(optimizer_
 def test_admission_splits_groups_and_rejects_impossible_operator():
     model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 4))
     store = SimulationStore()
-    runtime = prepare_graph_inplace(model, device=torch.device("cpu"), store=store, gpu_budget_bytes=14000)
+    runtime = prepare_graph_inplace(model, device=torch.device("cpu"), store=store, gpu_budget_bytes=10000)
     x = torch.randn(16, 4)
     model(x).sum().backward()
     assert len(runtime.ir.groups) > 1
-    assert all(group.estimated_working_set <= 14000 for group in runtime.ir.groups)
+    assert all(group.estimated_working_set <= 10000 for group in runtime.ir.groups)
     model.close()
     model = nn.Sequential(nn.Linear(4, 4))
     store = SimulationStore()
@@ -258,6 +258,17 @@ def test_admission_splits_groups_and_rejects_impossible_operator():
     with pytest.raises(RuntimeError, match="TRAINPOOL_UNSUPPORTED_WORKING_SET"):
         model(torch.ones(1, 4))
     assert not runtime.pending
+    model.close()
+
+
+def test_admission_does_not_count_region_input_and_output_aliases():
+    model = nn.Sequential(nn.Conv2d(6, 64, 3, padding=1))
+    store = SimulationStore()
+    budget = 1_200_000_000
+    runtime = prepare_graph_inplace(model, device=torch.device("cpu"), store=store, gpu_budget_bytes=budget)
+    runtime._preflight((torch.empty(8, 6, 256, 256),))
+    assert len(runtime.ir.groups) == 1
+    assert runtime.ir.groups[0].estimated_working_set <= budget
     model.close()
 
 

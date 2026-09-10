@@ -125,6 +125,9 @@ GPU. Graphs that cannot be captured or admitted fail explicitly.
 `pool_ram_owned` is already part of the budget; it is never added a second time.
 These are logical **training-state** capacities, not a single CUDA allocation.
 Other jobs, staging and changing host pressure can reduce available capacity.
+Human-readable CLI output uses familiar decimal units (`KB`, `MB`, `GB`, `TB`,
+base 1000) and automatically selects the appropriate size. JSON output keeps raw
+byte counts for compatibility; options explicitly named `--*-mib` remain binary MiB.
 
 ### Cluster inspection
 

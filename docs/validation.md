@@ -233,6 +233,39 @@ experiments on disposable jobs. Require numerical continuation or explicit Train
 failure; never classify a silent mismatch as success. Stopping the RAM provider loses
 single-copy data and is expected to fail affected jobs.
 
+### DeepLab fabric stress workload
+
+[`tests/models/deeplab_stress.py`](../tests/models/deeplab_stress.py) keeps multiple
+real DeepLabV3/ResNet50 models, gradients, buffers and optimizer states alive in one
+job. Auto mode estimates how many replicas reach 80% of currently available remote
+pool RAM while reserving 512 MiB and limiting the run to eight replicas. It prints
+JSON lines with remote residency, transfer counters, network wait and CUDA peaks.
+
+Keep the compute node's RAM contribution small so normal local-first placement uses
+the provider. If multicast discovery is filtered by Wi-Fi, give the provider as a
+seed when starting the compute daemon:
+
+```sh
+trainpool daemon --advertise-ip COMPUTE_IP --multicast-interface COMPUTE_IP \
+  --seed PROVIDER_IP:7432 --ram-limit-mib 4
+
+# In another terminal on the compute/GPU machine:
+trainpool --address 127.0.0.1:7432 python tests/models/deeplab_stress.py
+```
+
+Start with an explicit small run before auto-sizing:
+
+```sh
+trainpool --address 127.0.0.1:7432 python tests/models/deeplab_stress.py \
+  --replicas 1 --size 64 --batch 2 --steps 1 --hold-seconds 0
+```
+
+`--replicas` overrides capacity-based sizing. `--target-remote-fraction`,
+`--remote-reserve-mib`, `--max-replicas`, `--size`, `--batch` and `--steps` tune
+residency and compute load. The target is an estimate, not a quota; monitor both
+hosts and stop the foreground process with Ctrl-C if thermal, swap or network pressure
+is excessive. No tensor data or checkpoints are written to disk.
+
 ## Release gates still open
 
 - Broader physical CUDA working-set validation, float32 DeepLab numerical validation

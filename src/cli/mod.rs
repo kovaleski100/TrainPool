@@ -205,7 +205,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
             } else {
                 node.gpus
                     .iter()
-                    .map(|g| format!("{} / {}", g.model, gib(g.vram_total)))
+                    .map(|g| format!("{} / {}", g.model, format_bytes(g.vram_total)))
                     .collect::<Vec<_>>()
                     .join(", ")
             };
@@ -218,8 +218,8 @@ pub async fn execute(cli: Cli) -> Result<()> {
                     "peer"
                 },
                 node.cpu.logical_cores,
-                gib(node.memory.physical_ram_total),
-                gib(node.memory.trainpool_ram_available),
+                format_bytes(node.memory.physical_ram_total),
+                format_bytes(node.memory.trainpool_ram_available),
                 gpu
             );
             println!("  {}  {}", node.node_id, node.network.control_address);
@@ -236,7 +236,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
         );
         println!(
             "Election score: {}\nReason: highest total physical RAM + physical VRAM; largest UUID breaks ties\nLeader epoch: {}",
-            gib(status.leadership.election_score),
+            format_bytes(status.leadership.election_score),
             status.leadership.leader_epoch
         );
     }
@@ -259,7 +259,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
                 m.logical_training_capacity,
             ),
         ] {
-            println!("{label:<39} {}", gib(value));
+            println!("{label:<39} {}", format_bytes(value));
         }
         println!(
             "Disk spill: DISABLED\nLogical capacity combines distinct RAM and VRAM tiers; it is not one CUDA allocation or VRAM-speed memory."
@@ -267,8 +267,19 @@ pub async fn execute(cli: Cli) -> Result<()> {
     }
     Ok(())
 }
-fn gib(bytes: u64) -> String {
-    format!("{:.2} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [(&str, u64); 4] = [
+        ("TB", 1_000_000_000_000),
+        ("GB", 1_000_000_000),
+        ("MB", 1_000_000),
+        ("KB", 1_000),
+    ];
+    for (unit, divisor) in UNITS {
+        if bytes >= divisor {
+            return format!("{:.2} {unit}", bytes as f64 / divisor as f64);
+        }
+    }
+    format!("{bytes} B")
 }
 
 #[cfg(test)]
@@ -298,5 +309,14 @@ mod tests {
     fn legacy_run_remains_available() {
         let cli = Cli::try_parse_from(["trainpool", "run", "--", "python", "train.py"]).unwrap();
         assert!(matches!(cli.command, Command::Run { .. }));
+    }
+
+    #[test]
+    fn byte_sizes_use_familiar_decimal_units() {
+        assert_eq!(format_bytes(999), "999 B");
+        assert_eq!(format_bytes(1_000), "1.00 KB");
+        assert_eq!(format_bytes(1_500_000), "1.50 MB");
+        assert_eq!(format_bytes(16_659_828_736), "16.66 GB");
+        assert_eq!(format_bytes(2_500_000_000_000), "2.50 TB");
     }
 }
