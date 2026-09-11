@@ -52,7 +52,15 @@ class SimulationStore:
         self.values.clear()
 
 
-def parity(factory, optimizer_type, *, steps=3, shape=(2, 3, 16, 16), dtype=torch.float64):
+def parity(
+    factory,
+    optimizer_type,
+    *,
+    steps=3,
+    shape=(2, 3, 16, 16),
+    dtype=torch.float64,
+    optimizer_options=None,
+):
     torch.set_num_threads(1)
     torch.manual_seed(91)
     baseline = factory().to(dtype=dtype)
@@ -60,8 +68,9 @@ def parity(factory, optimizer_type, *, steps=3, shape=(2, 3, 16, 16), dtype=torc
     store = SimulationStore()
     runtime = prepare_graph_inplace(model, device=torch.device("cpu"), store=store)
     assert len(runtime.ir.groups) > 1
-    baseline_optimizer = optimizer_type(baseline.parameters(), lr=0.001, foreach=False)
-    optimizer = CapacityOptimizer(runtime, optimizer_type, {"lr": 0.001, "foreach": False})
+    options = {"lr": 0.001, "foreach": False, **(optimizer_options or {})}
+    baseline_optimizer = optimizer_type(baseline.parameters(), **options)
+    optimizer = CapacityOptimizer(runtime, optimizer_type, options)
     for _ in range(steps):
         optimizer.zero_grad()
         baseline_optimizer.zero_grad()
@@ -94,6 +103,18 @@ def parity(factory, optimizer_type, *, steps=3, shape=(2, 3, 16, 16), dtype=torc
         baseline_optimizer.step()
         for name, tensor in model.state_dict().items():
             torch.testing.assert_close(tensor, baseline.state_dict()[name], rtol=2e-4, atol=3e-6, msg=name)
+        for name, parameter in baseline.named_parameters():
+            expected_state = baseline_optimizer.state[parameter]
+            actual_state = runtime.records[name].optimizer_state.get(name, {})
+            assert actual_state.keys() == expected_state.keys(), name
+            for key, expected_value in expected_state.items():
+                actual_value = actual_state[key]
+                if isinstance(actual_value, TensorHandle):
+                    actual_value = store.restore(actual_value)
+                if isinstance(expected_value, torch.Tensor):
+                    torch.testing.assert_close(actual_value, expected_value, msg=f"{name}.{key}")
+                else:
+                    assert actual_value == expected_value
     return model, runtime, store
 
 
@@ -105,6 +126,88 @@ def test_unet_skip_concat_batchnorm_rng_and_optimizer_parity(optimizer):
     assert store.allocations > 100
     model.close()
     assert not store.values
+
+
+@pytest.mark.parametrize(
+    ("optimizer", "options"),
+    [
+        (
+            torch.optim.SGD,
+            {
+                "momentum": 0.9,
+                "dampening": 0,
+                "nesterov": True,
+                "weight_decay": 0.01,
+                "maximize": True,
+            },
+        ),
+        (
+            torch.optim.Adam,
+            {
+                "betas": (0.8, 0.95),
+                "eps": 1e-7,
+                "amsgrad": True,
+                "weight_decay": 0.01,
+                "maximize": True,
+            },
+        ),
+        (
+            torch.optim.AdamW,
+            {
+                "betas": (0.8, 0.95),
+                "eps": 1e-7,
+                "amsgrad": True,
+                "weight_decay": 0.01,
+                "maximize": True,
+            },
+        ),
+    ],
+)
+def test_optimizer_options_and_complete_state_parity(optimizer, options):
+    model, _, _ = parity(
+        lambda: UNet(width=2),
+        optimizer,
+        steps=2,
+        optimizer_options=options,
+    )
+    model.close()
+
+
+def test_optimizer_publication_failure_preserves_old_handles():
+    class FailingStore(SimulationStore):
+        def __init__(self):
+            super().__init__()
+            self.publications = 0
+
+        def transactional_offload(self, value, *, expected_next_use=None):
+            self.publications += 1
+            if self.publications == 2:
+                raise RuntimeError("injected durable publication failure")
+            return self.offload(value, expected_next_use=expected_next_use)
+
+    torch.manual_seed(7)
+    model = nn.Sequential(nn.Linear(4, 4)).double()
+    store = FailingStore()
+    runtime = prepare_graph_inplace(model, device=torch.device("cpu"), store=store)
+    optimizer = CapacityOptimizer(
+        runtime,
+        torch.optim.Adam,
+        {"lr": 0.001, "foreach": False},
+    )
+    optimizer.zero_grad()
+    model(torch.randn(2, 4, dtype=torch.float64)).square().mean().backward()
+    record = runtime.stages[0]
+    old_weight = record.weights["0.weight"]
+    old_gradient = record.gradients["0.weight"]
+    old_ids = set(store.values)
+    with pytest.raises(RuntimeError, match="injected durable publication failure"):
+        optimizer.step()
+    assert record.weights["0.weight"] is old_weight
+    assert record.gradients["0.weight"] is old_gradient
+    assert old_weight.id in store.values
+    assert old_gradient.id in store.values
+    assert old_ids <= set(store.values)
+    model.close()
 
 
 @pytest.mark.parametrize("optimizer", [torch.optim.SGD, torch.optim.Adam, torch.optim.AdamW])
@@ -130,13 +233,11 @@ def test_unknown_graph_is_rejected_before_materialization():
         capture(Unknown())
 
 
-@pytest.mark.parametrize("kind", ["unused_buffer", "shared_buffer", "complex", "extra_state"])
+@pytest.mark.parametrize("kind", ["shared_buffer", "complex", "extra_state"])
 def test_unsupported_state_is_rejected_before_model_changes(kind):
     model = nn.Sequential(nn.Linear(4, 4))
     error = "TRAINPOOL_UNSUPPORTED_BUFFER"
-    if kind == "unused_buffer":
-        model.register_buffer("unused", torch.ones(1))
-    elif kind == "shared_buffer":
+    if kind == "shared_buffer":
         buffer = torch.ones(1)
         model.register_buffer("first", buffer)
         model.register_buffer("second", buffer)
@@ -157,6 +258,43 @@ def test_unsupported_state_is_rejected_before_model_changes(kind):
     for name, parameter in model.named_parameters():
         assert parameter.device.type == "cpu"
         torch.testing.assert_close(parameter, before[name])
+
+
+def test_unreachable_registered_state_remains_checkpointable_and_unmaterialized():
+    class WithDormantState(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.active = nn.Linear(4, 4)
+            self.unused = nn.Linear(4, 4)
+            self.register_buffer("unused_scale", torch.arange(4, dtype=torch.float64))
+
+        def forward(self, value):
+            return self.active(value)
+
+    torch.manual_seed(29)
+    baseline = WithDormantState().double()
+    model = copy.deepcopy(baseline)
+    original_unused = baseline.unused.weight.detach().clone()
+    store = SimulationStore()
+    runtime = prepare_graph_inplace(model, device=torch.device("cpu"), store=store)
+    optimizer = CapacityOptimizer(runtime, torch.optim.AdamW, {"lr": 0.01, "foreach": False})
+    baseline_optimizer = torch.optim.AdamW(baseline.parameters(), lr=0.01, foreach=False)
+
+    optimizer.zero_grad()
+    baseline_optimizer.zero_grad()
+    value = torch.randn(3, 4, dtype=torch.float64)
+    baseline(value).square().mean().backward()
+    model(value).square().mean().backward()
+    optimizer.step()
+    baseline_optimizer.step()
+
+    assert set(runtime.dormant.weights) == {"unused.weight", "unused.bias"}
+    assert set(runtime.dormant.buffers) == {"unused_scale"}
+    assert not runtime.dormant.gradients
+    for name, tensor in model.state_dict().items():
+        torch.testing.assert_close(tensor, baseline.state_dict()[name], msg=name)
+    torch.testing.assert_close(model.state_dict()["unused.weight"], original_unused)
+    model.close()
 
 
 class BranchGraph(nn.Module):

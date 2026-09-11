@@ -10,7 +10,7 @@ flowchart LR
     SDK[PyTorch SDK on GPU host] -->|loopback control and chunks| A[Identical trainpool daemon A]
     A -->|allocation / resolve / plan| L[Identical trainpool daemon C: leader]
     L -->|allocation and migration instructions| B[Identical trainpool daemon B: RAM provider]
-    B <-->|direct tensor chunks| A
+    B <-->|reliable UDP or persistent TCP tensor chunks| A
     A <-->|bounded host staging| SDK
     SDK <-->|explicit tensor copies and compute| GPU[Local CUDA GPU]
 ```
@@ -23,8 +23,8 @@ intermediate hop solely because it is leader.
 
 * `cluster`: pluggable async discovery, multicast packets, membership timeout and election.
 * `node`: sysinfo CPU/RAM monitoring and optional, time-bounded nvidia-smi probing.
-* `transport` / `protocol`: versioned JSON control frames and separate binary data
-  connections. The transport trait is independent of policy; its MVP implementation is TCP.
+* `transport` / `protocol`: versioned framed-TCP control, persistent TCP reference
+  payload transport, and MTU-safe reliable selective-repeat UDP payload transport.
 * `memory`: lease-bearing block handles, atomic RAM reservations, local immutable
   committed storage, residency metadata and source-driven migration.
 * `scheduler`: directed link estimates, replaceable placement/planning interfaces and

@@ -1,6 +1,7 @@
 mod control;
 mod data;
 mod monitor;
+mod udp;
 
 use crate::{
     cluster::{
@@ -41,6 +42,8 @@ pub struct Runtime {
     pub active_transfers: std::sync::atomic::AtomicU32,
     pub staging:
         Mutex<std::collections::BTreeMap<Uuid, (crate::memory::allocator::Reservation, u64)>>,
+    pub udp_server: udp::UdpServerState,
+    pub tcp_data_pool: Mutex<std::collections::HashMap<SocketAddr, Vec<TcpStream>>>,
 }
 impl Runtime {
     pub async fn new(config: Config, node_id: Uuid) -> Result<Arc<Self>> {
@@ -68,6 +71,8 @@ impl Runtime {
             migration_gate: Mutex::new(()),
             active_transfers: std::sync::atomic::AtomicU32::new(0),
             staging: Mutex::new(std::collections::BTreeMap::new()),
+            udp_server: udp::UdpServerState::default(),
+            tcp_data_pool: Mutex::new(std::collections::HashMap::new()),
         }))
     }
     pub async fn local(&self) -> NodeCapabilities {
@@ -107,10 +112,49 @@ impl Runtime {
         self.refresh_memory().await;
         let membership = self.membership.read().await;
         let nodes = membership.nodes();
+        let mut logical_memory = LogicalTrainingMemory::from_nodes(&nodes);
+        if let Some(local) = nodes.iter().find(|node| node.node_id == self.node_id) {
+            logical_memory.local_physical_ram = local.memory.physical_ram_total;
+            logical_memory.local_os_available_ram = local.memory.os_available_ram;
+            logical_memory.local_pool_ram_budget = local.memory.trainpool_ram_budget;
+            logical_memory.local_pool_ram_used = local.memory.trainpool_ram_used;
+            logical_memory.local_pool_ram_allocatable = local.memory.trainpool_ram_available;
+            logical_memory.local_ram_safety_reserve = local.memory.safety_reserve;
+        }
+        logical_memory.remote_pool_ram_used = nodes
+            .iter()
+            .filter(|node| node.node_id != self.node_id)
+            .map(|node| node.memory.trainpool_ram_used)
+            .sum();
+        let metrics = self.metrics.lock().await;
+        if let Some(latest) = metrics
+            .jobs
+            .values()
+            .filter(|job| job.sdk_metrics_timestamp_ms.is_some())
+            .max_by_key(|job| job.sdk_metrics_timestamp_ms)
+        {
+            logical_memory.sdk_metrics_timestamp_ms = latest.sdk_metrics_timestamp_ms;
+            logical_memory.sdk_metrics_age_ms = latest
+                .sdk_metrics_timestamp_ms
+                .map(|timestamp| crate::now_ms().saturating_sub(timestamp));
+            logical_memory.driver_used_vram_bytes = latest.driver_used_vram_bytes;
+            logical_memory.sdk_physical_vram_bytes = latest.physical_vram_bytes;
+            logical_memory.driver_free_vram_bytes = latest.driver_free_vram_bytes;
+            logical_memory.torch_allocated_bytes = latest.torch_allocated_bytes;
+            logical_memory.torch_reserved_bytes = latest.torch_reserved_bytes;
+            logical_memory.torch_reclaimable_bytes = latest.torch_reclaimable_bytes;
+            logical_memory.trainpool_resident_vram_bytes = Some(latest.current_vram_resident_bytes);
+            logical_memory.safe_vram_allocatable_bytes = latest.safe_vram_allocatable_bytes;
+            logical_memory.configured_usable_vram_ceiling_bytes =
+                latest.configured_usable_vram_ceiling_bytes;
+            logical_memory.configured_vram_safety_reserve_bytes =
+                latest.configured_vram_safety_reserve_bytes;
+        }
+        drop(metrics);
         ClusterStatus {
             local_node: self.node_id,
             leadership: membership.leader(),
-            logical_memory: LogicalTrainingMemory::from_nodes(&nodes),
+            logical_memory,
             nodes,
             topology: self.topology.read().await.clone(),
             chunk_bytes: self.config.chunk_bytes,
@@ -124,22 +168,46 @@ impl Runtime {
     }
     pub async fn serve(self: Arc<Self>, listener: TcpListener) -> Result<()> {
         let permits = Arc::new(Semaphore::new(64));
+        let udp_permits = Arc::new(Semaphore::new(256));
+        let udp = Arc::new(tokio::net::UdpSocket::bind(listener.local_addr()?).await?);
         loop {
-            let (stream, peer) = listener.accept().await?;
-            let Ok(permit) = permits.clone().try_acquire_owned() else {
-                drop(stream);
-                continue;
-            };
-            let this = self.clone();
-            tokio::spawn(async move {
-                let _permit = permit;
-                match tokio::time::timeout(Duration::from_secs(120), this.connection(stream)).await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => tracing::debug!(%peer, %error, "request failed"),
-                    Err(_) => tracing::warn!(%peer, "connection deadline exceeded"),
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (stream, peer) = accepted?;
+                    let Ok(permit) = permits.clone().try_acquire_owned() else {
+                        drop(stream);
+                        continue;
+                    };
+                    let this = self.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        match tokio::time::timeout(Duration::from_secs(120), this.connection(stream)).await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => tracing::debug!(%peer, %error, "request failed"),
+                            Err(_) => tracing::warn!(%peer, "connection deadline exceeded"),
+                        }
+                    });
                 }
-            });
+                received = async {
+                    let mut buffer = vec![0_u8; crate::transport::udp::MAX_DATAGRAM];
+                    let (size, source) = udp.recv_from(&mut buffer).await?;
+                    buffer.truncate(size);
+                    Ok::<_, std::io::Error>((buffer, source))
+                } => {
+                    let (datagram, source) = received?;
+                    // Concurrency hides per-datagram integrity and metrics costs,
+                    // while the semaphore provides a hard bound on queued tasks
+                    // and naturally backpressures the kernel receive queue.
+                    let permit = udp_permits.clone().acquire_owned().await?;
+                    let this = self.clone();
+                    let socket = udp.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        this.udp_datagram(socket, datagram, source).await;
+                    });
+                }
+            }
         }
     }
     async fn connection(&self, mut stream: TcpStream) -> Result<()> {
@@ -148,26 +216,39 @@ impl Runtime {
             let _ = write_frame(&mut stream, &Response::error(&error)).await;
             return Err(error);
         }
-        let request = match read_frame::<Request>(&mut stream).await {
-            Ok(r) => r,
-            Err(e) => {
-                write_frame(&mut stream, &Response::error(&e)).await?;
-                return Err(e);
+        loop {
+            let request = match read_frame::<Request>(&mut stream).await {
+                Ok(request) => request,
+                Err(error)
+                    if error.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                        matches!(
+                            io.kind(),
+                            std::io::ErrorKind::UnexpectedEof
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::BrokenPipe
+                        )
+                    }) =>
+                {
+                    return Ok(());
+                }
+                Err(error) => {
+                    write_frame(&mut stream, &Response::error(&error)).await?;
+                    return Err(error);
+                }
+            };
+            if matches!(
+                request,
+                Request::WriteChunk { .. } | Request::ReadChunk { .. } | Request::Probe { .. }
+            ) {
+                if let Err(error) = self.data(&mut stream, request).await {
+                    let _ = write_frame(&mut stream, &Response::error(&error)).await;
+                    return Err(error);
+                }
+            } else {
+                let response = self.control(request).await.unwrap_or_else(Response::error);
+                write_frame(&mut stream, &response).await?;
             }
-        };
-        if matches!(
-            request,
-            Request::WriteChunk { .. } | Request::ReadChunk { .. } | Request::Probe { .. }
-        ) {
-            if let Err(error) = self.data(&mut stream, request).await {
-                let _ = write_frame(&mut stream, &Response::error(&error)).await;
-                return Err(error);
-            }
-        } else {
-            let response = self.control(request).await.unwrap_or_else(Response::error);
-            write_frame(&mut stream, &response).await?;
         }
-        Ok(())
     }
 }
 

@@ -38,14 +38,30 @@ fn static_memory_election_and_ties() {
 }
 #[test]
 fn ram_budget_does_not_recursively_shrink() {
-    let before = MemoryCapabilities::calculate(32 * GIB, 16 * GIB, 0, 0.5, None);
-    let allocated = MemoryCapabilities::calculate(32 * GIB, 8 * GIB, 8 * GIB, 0.5, None);
-    let pressure = MemoryCapabilities::calculate(32 * GIB, 4 * GIB, 8 * GIB, 0.5, None);
-    assert_eq!(before.trainpool_ram_budget, 8 * GIB);
-    assert_eq!(allocated.trainpool_ram_budget, 8 * GIB);
-    assert_eq!(pressure.trainpool_ram_budget, 6 * GIB);
-    assert_eq!(pressure.excess(), 2 * GIB);
+    let before = MemoryCapabilities::calculate(32 * GIB, 16 * GIB, 0, 0.5, None, 0, 0.0);
+    let allocated = MemoryCapabilities::calculate(32 * GIB, 8 * GIB, 8 * GIB, 0.5, None, 0, 0.0);
+    let pressure = MemoryCapabilities::calculate(32 * GIB, 0, 20 * GIB, 0.5, None, 0, 0.0);
+    assert_eq!(before.trainpool_ram_budget, 16 * GIB);
+    assert_eq!(allocated.trainpool_ram_budget, 16 * GIB);
+    assert_eq!(pressure.trainpool_ram_budget, 16 * GIB);
+    assert_eq!(pressure.excess(), 4 * GIB);
     assert_eq!(pressure.trainpool_ram_available, 0);
+}
+
+#[test]
+fn local_ram_budget_applies_explicit_reserve_to_live_os_headroom() {
+    let sample = MemoryCapabilities::calculate(1_000, 800, 100, 0.9, None, 100, 0.1);
+    assert_eq!(sample.physical_ram_total, 1_000);
+    assert_eq!(sample.os_available_ram, 800);
+    assert_eq!(sample.safety_reserve, 100);
+    assert_eq!(sample.trainpool_ram_budget, 800);
+    assert_eq!(sample.trainpool_ram_used, 100);
+    assert_eq!(sample.trainpool_ram_available, 700);
+    assert_eq!(sample.safe_local_ram_allocatable_now, 700);
+
+    let pressure = MemoryCapabilities::calculate(1_000, 200, 600, 0.9, None, 100, 0.1);
+    assert_eq!(pressure.trainpool_ram_budget, 700);
+    assert_eq!(pressure.safe_local_ram_allocatable_now, 100);
 }
 #[test]
 fn cpu_only_leader_and_single_gpu_plan() {
@@ -157,7 +173,9 @@ fn configuration_and_identity_are_safe() {
     let dir = tempfile::tempdir().unwrap();
     assert_eq!(node_id(dir.path()).unwrap(), node_id(dir.path()).unwrap());
     let mut config = Config::default();
-    assert_eq!(config.ram_fraction, 0.50);
+    assert_eq!(config.ram_fraction, 0.90);
+    assert_eq!(config.ram_reserve_bytes, GIB);
+    assert_eq!(config.ram_reserve_fraction, 0.10);
     assert_eq!(config.vram_reserve_bytes, 96 * 1024 * 1024);
     assert_eq!(config.vram_reserve_fraction, 0.02);
     assert!(!config.disk.enabled);

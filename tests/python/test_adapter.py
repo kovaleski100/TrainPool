@@ -46,8 +46,9 @@ def test_sequential_matches_full_pytorch_training(cluster, optimizer_type, prefe
                 for name, parameter in reference.named_parameters():
                     torch.testing.assert_close(restored[name], parameter, rtol=1e-5, atol=1e-6)
             metrics = clients[0].control("metrics")["jobs"][store.job_id]
-            assert metrics["bytes_local_to_remote_ram"] > 0
-            assert metrics["bytes_remote_ram_to_local"] > 0
+            assert metrics["bytes_local_to_remote_ram"] == 0
+            assert metrics["bytes_remote_ram_to_local"] == 0
+            assert metrics["current_local_ram_backing_bytes"] > 0
             assert any(s.optimizer_state for s in prepared.stages if s.weights)
         finally:
             prepared.prefetch.close()
@@ -155,22 +156,23 @@ def test_training_example_exceeds_configured_residency_with_remote_state(cluster
             str(root / "examples/train_sequential.py"),
             "--test-cpu",
             "--width",
-            "128",
+            "512",
             "--layers",
             "24",
             "--resident-budget-mib",
-            "1",
+            "8",
             "--steps",
             "1",
             "--memory-node",
             clients[1].local_node,
         ],
         env=environment,
-        check=True,
+        check=False,
         capture_output=True,
         text=True,
         timeout=90,
     )
+    assert result.returncode == 0, result.stderr
     first = json.loads(result.stdout.splitlines()[0])
     assert first["parameter_bytes"] > first["configured_residency_budget"]
     assert first["remote_backing_bytes"] > 0

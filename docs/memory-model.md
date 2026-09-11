@@ -2,11 +2,14 @@
 
 ## Safe RAM contribution
 
-For fraction `f=0.50` by default:
+The default contribution ceiling is `f=0.90`, with an explicit reserve of the
+larger of 1 GB or 10% of physical RAM:
 
 ```
 effective = min(physical_ram, os_available_ram + trainpool_owned_ram)
-budget = min(f * effective, optional_absolute_contribution_ceiling)
+reserve = max(ram_reserve_bytes, physical_ram * ram_reserve_fraction)
+safe_capacity = max(0, effective - reserve)
+budget = min(safe_capacity, f * physical_ram, optional_absolute_contribution_ceiling)
 allocatable = max(0, budget - owned)
 excess = max(0, owned - budget)
 ```
@@ -17,13 +20,9 @@ active relay buffers and SDK-declared staging buffers. Atomic reservations preve
 concurrent requests from collectively exceeding the last sampled budget. Allocation
 and staging requests refresh OS memory information before admission.
 
-| OS available | TrainPool owned | Effective | Budget at 0.50 | Excess |
-|---:|---:|---:|---:|---:|
-| 16 GiB | 0 GiB | 16 GiB | 8 GiB | 0 GiB |
-| 8 GiB | 8 GiB | 16 GiB | 8 GiB | 0 GiB |
-| 4 GiB | 8 GiB | 12 GiB | 6 GiB | 2 GiB |
-
-Ownership, rather than just current free RAM, is what keeps the budget stable. The
+Ownership is added back only when deriving effective current capacity, so allocating
+TrainPool RAM does not recursively shrink its own budget. The reserve is subtracted
+exactly once. The
 absolute `--ram-limit-mib` ceiling is useful for protecting test machines and forcing
 remote placement without exhausting the host.
 
@@ -60,7 +59,7 @@ that normalization can itself require a tensor-sized allocation on the original
 device. Models used for capacity experiments should use contiguous stage parameters.
 The SDK cannot make a single operation whose working set exceeds every GPU executable.
 
-## GPU resource class
+## GPU resource class and authoritative SDK snapshot
 
 ```
 adaptive = min(0.02 * physical_vram_total, 256 MiB)
@@ -69,9 +68,24 @@ usable_vram = max(0, current_free_vram - reserve)
 ```
 
 Both reserve terms are configurable; an explicitly larger byte floor is not capped.
-The SDK additionally checks `torch.cuda.mem_get_info()` before promotion and group
-execution, allowing observed pressure to trigger eviction. Status distinguishes physical, free, usable and
-SDK-reported allocated VRAM. The SDK uses explicit tensor copies and PyTorch CUDA
+The Python process that owns the CUDA context is authoritative for execution-time
+admission. It samples:
+
+```
+reclaimable = max(0, torch_reserved - torch_allocated)
+physical_allocator_headroom = driver_free + reclaimable
+budget_headroom = max(0, configured_usable_ceiling - torch_allocated)
+safe_allocatable_now = min(physical_allocator_headroom, budget_headroom)
+```
+
+`driver_free` excludes PyTorch allocator cache, so reclaimable cache is added only to
+physical headroom. `trainpool_resident` is already a subset of `torch_allocated`; it
+is reported separately and is never added to headroom. This prevents double counting.
+The SDK re-samples before each admitted graph group and optimizer parameter, allowing
+observed pressure to trigger eviction. Status distinguishes physical, free, usable,
+allocated, reserved, reclaimable and TrainPool-resident VRAM. Reports are throttled to
+at most one every 250 ms except forced shutdown snapshots. The SDK uses explicit tensor
+copies and PyTorch CUDA
 allocation; the Rust block store never claims to allocate a distributed CUDA pointer.
 GPU observations are refreshed about every ten seconds. SDK GPU allocation reports
 come from PyTorch process allocator statistics, so they assume one training job per
@@ -88,9 +102,11 @@ latency + bytes / estimated_bandwidth
 ```
 
 The remote heuristic increases cost for active transfer load, prefers available
-capacity on equal cost and uses UUIDs for deterministic ties. Capacity is rechecked at the owner, so stale announcements
-cannot bypass the local RAM budget. Failed candidates are tried in ranked order;
-explicit `preferred_node` intentionally pins placement to that provider.
+capacity on equal cost and uses UUIDs for deterministic ties. The leader synchronously
+refreshes compute-node RAM before placement and the owner rechecks capacity. The
+compute node is always the first RAM candidate. Only if it rejects admission can remote
+providers be ranked by topology. `preferred_node` is a hint among remote candidates
+and cannot bypass valid local RAM.
 
 Pressure events contain owned bytes, revised budget and excess. The leader serializes
 pressure relief, picks committed source blocks deterministically, and migrates until

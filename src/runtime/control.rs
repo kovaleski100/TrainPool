@@ -118,6 +118,18 @@ impl Runtime {
                 m.eviction_count += metrics.eviction_count;
                 m.prefetch_count += metrics.prefetch_count;
                 m.gpu_id = metrics.gpu_id.clone();
+                m.sdk_metrics_timestamp_ms = metrics.sdk_metrics_timestamp_ms;
+                m.physical_vram_bytes = metrics.physical_vram_bytes;
+                m.driver_free_vram_bytes = metrics.driver_free_vram_bytes;
+                m.driver_used_vram_bytes = metrics.driver_used_vram_bytes;
+                m.torch_allocated_bytes = metrics.torch_allocated_bytes;
+                m.torch_reserved_bytes = metrics.torch_reserved_bytes;
+                m.torch_reclaimable_bytes = metrics.torch_reclaimable_bytes;
+                m.safe_vram_allocatable_bytes = metrics.safe_vram_allocatable_bytes;
+                m.configured_usable_vram_ceiling_bytes =
+                    metrics.configured_usable_vram_ceiling_bytes;
+                m.configured_vram_safety_reserve_bytes =
+                    metrics.configured_vram_safety_reserve_bytes;
                 drop(all);
                 if let Some(id) = metrics.gpu_id {
                     let mut members = self.membership.write().await;
@@ -199,7 +211,30 @@ impl Runtime {
                     );
                     ensure!(job.plan.leader_epoch == epoch, "TRAINPOOL_STALE_LEADER");
                 }
-                self.refresh_memory().await;
+                // Placement is a strict tier boundary: GPU residency is managed
+                // by the SDK, then the compute node's current RAM is tried before
+                // any remote RAM. Refresh the compute node synchronously so a
+                // stale gossip sample cannot bypass available local memory.
+                if compute_node == self.node_id {
+                    self.refresh_memory().await;
+                } else {
+                    let compute_address = self
+                        .membership
+                        .read()
+                        .await
+                        .peers
+                        .get(&compute_node)
+                        .map(|peer| peer.capabilities.network.control_address);
+                    if let Some(address) = compute_address
+                        && let Ok(capabilities) = self
+                            .transport
+                            .control(address, &Request::Capabilities)
+                            .await
+                            .and_then(|response| response.into_data())
+                    {
+                        self.membership.write().await.update(capabilities);
+                    }
+                }
                 let nodes = self.membership.read().await.nodes();
                 let candidates = CapacityPlacement.rank_ram(
                     &nodes,
@@ -209,10 +244,10 @@ impl Runtime {
                 );
                 let leadership = self.leadership().await;
                 let mut last_error = "no eligible memory nodes".to_owned();
-                for node in candidates
-                    .into_iter()
-                    .filter(|n| preferred_node.is_none_or(|id| n.node_id == id))
-                {
+                for node in candidates.into_iter().filter(|node| {
+                    node.node_id == compute_node
+                        || preferred_node.is_none_or(|id| node.node_id == id)
+                }) {
                     let handle = MemoryBlockHandle {
                         id: Uuid::new_v4(),
                         job_id,

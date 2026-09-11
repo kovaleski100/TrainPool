@@ -297,62 +297,114 @@ class CapacityOptimizer:
         model = self.model
         if model.failed or not model.backward_complete:
             raise TrainPoolError("Complete a successful backward before optimizer.step")
+        current_context = "optimizer admission did not start"
         try:
             for record in model.stages:
                 if not record.trainable:
                     continue
-                parameters = {
-                    name: nn.Parameter(model.store.restore(record.weights[name], device=model.device))
-                    for name in record.weights
-                    if name in record.trainable
-                }
-                guard = getattr(model, "instrumentation_guard", contextlib.nullcontext)
-                with guard():
-                    optimizer = self.optimizer_type(list(parameters.values()), **self.options)
-                for name, parameter in parameters.items():
-                    if name in record.gradients:
-                        parameter.grad = model.store.restore(record.gradients[name], device=model.device)
-                    state = record.optimizer_state.get(name, {})
+                for name in record.weights:
+                    if name not in record.trainable or name not in record.gradients:
+                        continue
+                    weight_handle = record.weights[name]
+                    gradient_handle = record.gradients[name]
+                    old_state = record.optimizer_state.get(name, {})
+                    state_handles = [value for value in old_state.values() if isinstance(value, TensorHandle)]
+                    parameter_bytes = weight_handle.size
+                    gradient_bytes = gradient_handle.size
+                    actual_state_bytes = sum(handle.size for handle in state_handles)
+                    is_adam = self.optimizer_type in (torch.optim.Adam, torch.optim.AdamW)
+                    expected_state_bytes = (
+                        parameter_bytes * (2 + int(bool(self.options.get("amsgrad"))))
+                        if is_adam
+                        else parameter_bytes * int(bool(self.options.get("momentum", 0)))
+                    )
+                    state_bytes = max(actual_state_bytes, expected_state_bytes)
+                    temporary_bytes = parameter_bytes * (2 if is_adam else 1)
+                    allocator_margin = max(16 * 1024 * 1024, parameter_bytes // 10)
+                    required = (
+                        parameter_bytes + gradient_bytes + state_bytes + temporary_bytes + allocator_margin
+                    )
+                    current_context = (
+                        f"parameter={name} parameter_bytes={parameter_bytes} "
+                        f"gradient_bytes={gradient_bytes} optimizer_state_bytes={state_bytes} "
+                        f"estimated_temporary_bytes={temporary_bytes}"
+                    )
+                    transient_handles = (weight_handle, gradient_handle, *state_handles)
+                    prepare_transient = getattr(model.store, "prepare_transient", None)
+                    if prepare_transient is not None:
+                        prepare_transient(transient_handles)
+                    if hasattr(model.store, "ensure_cuda_capacity"):
+                        model.store.ensure_cuda_capacity(
+                            required,
+                            context=current_context,
+                        )
+
+                    restore = getattr(model.store, "restore_transient", model.store.restore)
+                    parameter = nn.Parameter(restore(weight_handle, device=model.device))
+                    parameter.grad = restore(gradient_handle, device=model.device)
+                    guard = getattr(model, "instrumentation_guard", contextlib.nullcontext)
+                    with guard():
+                        optimizer = self.optimizer_type([parameter], **self.options)
                     optimizer.state[parameter] = {
-                        key: model.store.restore(value, device="cpu" if key == "step" else model.device)
+                        key: restore(
+                            value,
+                            device="cpu" if key == "step" else model.device,
+                        )
                         if isinstance(value, TensorHandle)
                         else value
-                        for key, value in state.items()
+                        for key, value in old_state.items()
                     }
-                optimizer.step()
-                # Publish new state only after successful uploads. Old state remains valid on failure.
-                new_weights = {
-                    name: model.store.offload(parameter, expected_next_use="next forward")
-                    for name, parameter in parameters.items()
-                }
-                new_states = {
-                    name: {
-                        key: model.store.offload(value, expected_next_use="next optimizer.step")
-                        if isinstance(value, torch.Tensor)
-                        else value
-                        for key, value in optimizer.state[parameter].items()
-                    }
-                    for name, parameter in parameters.items()
-                }
-                for name, handle in new_weights.items():
-                    model.store.free(record.weights[name])
-                    record.weights[name] = handle
-                for state in record.optimizer_state.values():
-                    for value in state.values():
+                    optimizer.step()
+
+                    publish = getattr(
+                        model.store,
+                        "transactional_offload",
+                        model.store.offload,
+                    )
+                    replacements = []
+                    try:
+                        new_weight = publish(
+                            parameter,
+                            expected_next_use="next forward",
+                        )
+                        replacements.append(new_weight)
+                        new_state = {}
+                        for key, value in optimizer.state[parameter].items():
+                            replacement = (
+                                publish(
+                                    value,
+                                    expected_next_use="next optimizer.step",
+                                )
+                                if isinstance(value, torch.Tensor)
+                                else value
+                            )
+                            new_state[key] = replacement
+                            if isinstance(replacement, TensorHandle):
+                                replacements.append(replacement)
+                    except BaseException:
+                        for handle in replacements:
+                            model.store.free(handle)
+                        raise
+
+                    # Logical swap occurs only after every new handle is durable.
+                    record.weights[name] = new_weight
+                    record.optimizer_state[name] = new_state
+                    model.store.free(weight_handle)
+                    for value in old_state.values():
                         if isinstance(value, TensorHandle):
                             model.store.free(value)
-                record.optimizer_state = new_states
-                for handle in record.gradients.values():
-                    model.store.free(handle)
-                record.gradients.clear()
-                del parameters, optimizer
+                    model.store.free(gradient_handle)
+                    record.gradients.pop(name, None)
+                    del parameter, optimizer, replacements
             model.pending = False
             model.backward_complete = False
             model.store.flush_metrics()
         except torch.OutOfMemoryError as error:
             model.failed = True
+            snapshot = getattr(model.store, "cuda_memory_snapshot", lambda: None)()
+            diagnostic = f" {snapshot.diagnostic()}" if snapshot is not None else ""
             raise TrainPoolError(
-                "TRAINPOOL_UNSUPPORTED_WORKING_SET: CUDA allocation during optimizer.step"
+                f"TRAINPOOL_UNSUPPORTED_WORKING_SET: {current_context}{diagnostic}"
             ) from error
         except BaseException:
             model.failed = True

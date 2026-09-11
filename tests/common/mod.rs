@@ -28,10 +28,12 @@ pub fn node(id: u128, ram_gib: u64, gpu_gib: Option<u64>) -> NodeCapabilities {
         os: "mock".into(),
         architecture: "x86_64".into(),
         cpu: CpuCapabilities::default(),
-        memory: MemoryCapabilities::calculate(ram_gib * GIB, ram_gib * GIB, 0, 0.5, None),
+        memory: MemoryCapabilities::calculate(ram_gib * GIB, ram_gib * GIB, 0, 0.9, None, GIB, 0.1),
         network: NetworkCapabilities {
             control_address: format!("127.0.0.1:{}", 7432 + id).parse().unwrap(),
+            data_address: Some(format!("127.0.0.1:{}", 7432 + id).parse().unwrap()),
             transport: "mock".into(),
+            data_transport: "udp".into(),
             chunk_bytes: Config::default().chunk_bytes,
             active_transfers: 0,
         },

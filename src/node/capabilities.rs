@@ -14,7 +14,11 @@ pub struct RuntimeCapabilities {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NetworkCapabilities {
     pub control_address: SocketAddr,
+    #[serde(default)]
+    pub data_address: Option<SocketAddr>,
     pub transport: String,
+    #[serde(default)]
+    pub data_transport: String,
     pub chunk_bytes: usize,
     pub active_transfers: u32,
 }
@@ -54,6 +58,8 @@ impl NodeCapabilities {
             owned,
             config.ram_fraction,
             config.ram_limit_bytes,
+            config.ram_reserve_bytes,
+            config.ram_reserve_fraction,
         );
     }
     pub async fn detect(id: Uuid, address: SocketAddr, config: &Config) -> Self {
@@ -93,7 +99,9 @@ impl NodeCapabilities {
             gpus,
             network: NetworkCapabilities {
                 control_address: address,
-                transport: "framed-tcp".into(),
+                data_address: Some(address),
+                transport: "framed-tcp-control".into(),
+                data_transport: config.data_transport.clone(),
                 chunk_bytes: config.chunk_bytes,
                 active_transfers: 0,
             },

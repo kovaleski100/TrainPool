@@ -9,6 +9,8 @@ pub struct GpuAssignment {
     pub node_id: Uuid,
     pub gpu_id: String,
     pub usable_bytes: u64,
+    /// Explicit driver-free headroom excluded when the plan was sampled.
+    pub safety_reserve_bytes: u64,
     pub capacity_share: f64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -66,6 +68,7 @@ impl TrainingPlanner for CapacityPlanner {
                         node_id: n.node_id,
                         gpu_id: g.uuid.clone(),
                         usable_bytes: g.usable_vram,
+                        safety_reserve_bytes: g.vram_free.saturating_sub(g.usable_vram),
                         capacity_share: 0.0,
                     })
             })

@@ -46,9 +46,9 @@ pytest -q
 python scripts/two_node_demo.py
 ```
 
-The final CPU suite passed **44 tests**, with 3 opt-in CUDA tests skipped; Rust
-passed **24 tests** (6 runtime/CLI,
-15 core, 3 fabric). Formatting, Clippy with warnings denied, release build and the
+The final CPU suite passed **50 tests**, with 3 opt-in CUDA tests skipped; Rust
+passed **33 tests** (11 runtime/CLI/UDP unit tests,
+16 core, 6 fabric). Formatting, Clippy with warnings denied, release build and the
 release-binary two-node demo passed. Physical CUDA tests are opt-in and skipped in
 CPU CI unless an explicit CUDA fabric endpoint is supplied.
 
@@ -108,6 +108,86 @@ Python coverage includes:
 This is useful stress coverage, not certification for unlimited duration or arbitrary
 network failures. Single-copy RAM loss explicitly fails the job; there is no automatic
 recovery. Longer real-network soak runs remain part of physical validation.
+
+## Reliable UDP / streaming optimizer validation (2026-09-11)
+
+The work started from branch `main` at
+`f02df3231187b7145ca2531e2c69b75a1c08d6b2`. The existing daemon on port 7432 was
+left running and was not re-instantiated. All current-binary experiments used isolated
+loopback ports and temporary metadata directories.
+
+The final automated run passed 33 Rust tests and 50 Python tests (3 opt-in CUDA tests
+skipped by the ordinary Python suite). Rust transport coverage includes authenticated
+MTU-safe encoding, sparse bitmap ACKs, 0%, 0.1%, 1% and 5% injected loss, reorder,
+duplicates, selective retransmission, corrupt datagrams/block checksums, dropped FIN
+and COMPLETE, retry exhaustion/ABORT, stale transfers, bounded sessions/backpressure,
+the local-owner fast path and persistent TCP reuse. SGD, Adam and AdamW are compared
+against ordinary PyTorch for multiple steps, including momentum/dampening/Nesterov,
+weight decay, betas/epsilon, AMSGrad, maximize, AdamW decoupled decay, step state and
+transaction rollback.
+
+### Loopback UDP versus persistent TCP
+
+Two current-release daemons were used for each backend. The compute-side RAM budget
+was 32 MB, the provider budget was 2.147 GB, chunks were 16 MB, and every returned byte
+was verified. Values below use decimal MB/Gbit/s. This is a same-host loopback result,
+not Wi-Fi or Ethernet evidence.
+
+| Backend / object | Wall time | Effective bidirectional throughput | Client CPU | Compute-daemon CPU | Network wait | Retransmit / TCP reuse |
+|---|---:|---:|---:|---:|---:|---:|
+| UDP / 64 MB | 3.560 s | 0.288 Gbit/s | 2.53% core | 25.00% core | 3,400 ms | 0 datagrams |
+| UDP / 256 MB | 14.104 s | 0.290 Gbit/s | 2.19% core | 23.89% core | 13,584 ms | 1 datagram |
+| UDP / 1,024 MB | 102.441 s | 0.160 Gbit/s | 1.17% core | 13.43% core | 56,496 ms | 0 datagrams |
+| TCP / 64 MB | 0.237 s | 4.327 Gbit/s | 39.96% core | 42.26% core | 83 ms | 1 open / 7 reused |
+| TCP / 256 MB | 0.856 s | 4.784 Gbit/s | 36.73% core | 45.55% core | 329 ms | 0 open / 32 reused |
+| TCP / 1,024 MB | 3.367 s | 4.866 Gbit/s | 35.85% core | 45.74% core | 1,339 ms | 0 open / 128 reused |
+
+The corrected 64 MB UDP rerun measured RTT 1.771 ms and adaptive RTO 10 ms, with
+60,020 sent and 75,987 received datagrams. The first full matrix exposed that a
+receive-only completion could replace a valid sender RTT/RTO sample with zero; that
+observability bug was fixed and the nonzero sample was confirmed. The transfer
+throughput and packet counters in the full matrix are unaffected.
+
+TCP persistent is decisively faster on loopback. Reliable UDP is therefore the
+functional default candidate required by this milestone, but these measurements do
+not support claiming that it outperforms TCP. Its high per-datagram/ACK cost and the
+1,200-byte payload are clear optimization targets; a real LAN matrix is still needed.
+
+### Original U-Net, batch 8, Adam, physical RTX 3050
+
+The unmodified `tests/models/unet/Train.py` ran under `/home/kovaleski100/meu-env`
+with 6 input channels, batch size 8, Adam, four total optimizer iterations (two folds,
+two steps per fold) and `PYTORCH_ALLOC_CONF=expandable_segments:True`. Only evaluation
+volume was shortened (`test_ratio=0.0002`, `kfold=2`); model, input resolution, batch
+and optimizer were unchanged. The first fold completed both optimizer steps and began
+the next fold, and the whole command exited successfully in 994 seconds. Fold losses
+printed after the first step were 0.66298246 and 0.71932513.
+
+The GPU was an NVIDIA GeForce RTX 3050 Laptop (4.096 GB physical, driver 580.95.05;
+PyTorch reported 3.951 GB). The configured usable ceiling was 3.701 GB with a
+100.663 MB safety reserve. Observed peaks were 3.430 GB PyTorch/working-set residency,
+1.559 GB TrainPool-resident handles, 33.281 MB local RAM backing and 1.888 GB remote
+RAM backing. During a sampled phase the driver reported 3.515 GB used, PyTorch
+1.062 GB allocated / 2.798 GB reserved / 1.735 GB reclaimable. On final cleanup,
+allocated and TrainPool-resident VRAM were zero.
+
+The job transferred 16.782 GB of UDP payload/network bytes, issued 337 retransmissions
+over 9,169,734 sent datagrams, recorded no failed transfer, and spent 679.261 seconds
+in network wait (about 68% of wall time). Thus parameter-streaming avoids the former
+Adam OOM, but current reliable-UDP overhead materially dominates this same-host stress
+run. The run also exposed a harmless-but-real finalizer error (`join` of the lease
+thread from itself); `TensorStore.close()` now skips self-join while still performing
+durable-handle cleanup, with a dedicated regression test.
+
+### Separate physical peer gate
+
+The second computer was rediscovered at `10.0.0.239`: ICMP succeeded and its existing
+TrainPool TCP port 7432 accepted connections. SSH port 22 refused connections, however,
+so the current binary could not be copied or started there without changing the user's
+existing service. Consequently the three separate-machine locality cases and Wi-Fi/LAN
+UDP-versus-TCP matrix remain pending. The loopback provider was intentionally advertised
+as RAM-only and validates code paths and capacity tiers, but is not misrepresented as a
+separate physical node.
 
 The first hosted CI run exposed unstable float32 loss comparison for DeepLab with
 only two 16x16 images: both steps completed, but the second loss differed by 0.00675.

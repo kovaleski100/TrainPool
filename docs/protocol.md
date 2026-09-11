@@ -12,10 +12,38 @@ before decoding the message schema. Unknown operations and fields are rejected b
 the request enum. UUIDs are canonical strings and byte counts are unsigned integers.
 No pickle, object constructors, executable code or tensor file paths are accepted.
 
-Each TCP connection authenticates and performs one operation. Multiple data connections
-can run simultaneously; a long transfer does not occupy a shared control connection.
-The daemon limits accepted in-flight connections to 64 and applies 5-second outbound
-connect/authentication and 120-second operation deadlines.
+Control uses authenticated framed TCP. The reference TCP data backend authenticates
+once, performs multiple framed chunk operations on the connection, and returns healthy
+connections to a bounded per-destination pool. Multiple data connections can run
+simultaneously; a long transfer does not occupy a shared control connection. The
+daemon limits accepted in-flight connections to 64 and applies bounded deadlines.
+
+## Reliable UDP data plane
+
+Remote tensor payload uses reliable UDP by default; `data-transport=tcp` selects the
+persistent reference backend. Local owner payload never enters either daemon-to-daemon
+transport.
+
+Every UDP datagram fits a 1400-byte envelope (166-byte header and at most 1200 payload
+bytes) and contains magic/version, kind/flags, transfer UUID, job/object UUID, block
+UUID, lease UUID, generation, sequence, absolute offset, block size, payload length,
+BLAKE3 payload digest and HMAC-SHA256 tag. IPv4 and IPv6 sockets are supported without
+depending on IP fragmentation.
+
+A START declares transfer length, packet count and whole-transfer BLAKE3. START_ACK
+negotiates the receiver window. The sender uses bounded selective-repeat windows (up
+to 256 packets), per-datagram pacing and bitmap ACK/NACK messages. Arrival order is
+irrelevant: the receiver validates each packet and copies it to its declared offset in
+a bounded staging buffer. Received bitmap entries are retained and only missing
+sequences are retransmitted. RTT uses an EWMA with variance; RTO is bounded to
+10–2000 ms. Loss applies pacing backoff and multiplicative window decrease. Retry
+exhaustion sends ABORT and fails explicitly.
+
+The receiver bounds concurrent write and read sessions, reserves each staging buffer
+against RAM accounting and returns a backpressure error when full. Duplicate and stale
+sequence/session IDs are detected. FIN succeeds only after every sequence and the
+whole-transfer digest match; COMPLETE is cached briefly so a retransmitted FIN after a
+dropped final ACK is idempotent. Commit still checks the full block before Ready.
 
 ## Authentication
 
@@ -94,11 +122,12 @@ metadata. This allows a tensor larger than one owner's RAM to span multiple bloc
 ## Write sequence
 
 1. `allocate` returns a writing-state handle; the owner has reserved its whole size.
-2. Send `write_chunk` with handle, transfer ID, offset, length, total size and BLAKE3
-   chunk checksum. Default maximum is 64 MiB; peers negotiate the smallest limit.
-3. Owner sends a successful ready response before accepting bytes.
-4. Send exactly `length` raw bytes. Owner receives directly into its allocation slice,
-   verifies the chunk, advances its incremental full-object hash and acknowledges.
+2. Send `write_chunk` to the local daemon with handle, transfer ID, offset, length,
+   total size and BLAKE3 chunk checksum. Default maximum is 64 MiB.
+3. For a local owner, the daemon writes directly to `LocalRam`. For a remote owner it
+   uses reliable UDP or the configured persistent TCP reference backend.
+4. The owner validates the transfer digest, advances its incremental full-object hash
+   and acknowledges completion.
 5. Repeat in strictly increasing contiguous offsets with the same transfer ID.
 6. `commit` supplies the complete BLAKE3 digest. Incomplete/wrong-hash uploads remain
    unreadable. The returned handle contains the complete digest and ready state.

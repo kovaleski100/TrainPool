@@ -14,7 +14,8 @@ Tensor files, disk spill and TrainPool-managed swap are absent from the implemen
 * UDP multicast discovery, authenticated capability exchange, 2-second heartbeats,
   7-second failure detection and deterministic leader election by physical RAM + VRAM.
 * Safe RAM budgets, atomic ownership accounting, bounded SDK/relay staging, RAM blocks,
-  BLAKE3 checksums, chunked transfers, lease renewal/free and direct node-to-node migration.
+  BLAKE3 checksums, reliable selective-repeat UDP payloads, a persistent TCP reference
+  backend, lease renewal/free and direct node-to-node migration.
 * CPU-only RAM providers, deterministic single-GPU compute placement, topology
   estimates and on-demand directed bandwidth measurements.
 * Transparent PyTorch activation through `trainpool python ...`, plus tensor
@@ -24,7 +25,7 @@ Tensor files, disk spill and TrainPool-managed swap are absent from the implemen
 
 **Status: progress toward v1, not a v1 release.** Transparent graph execution supports
 U-Net and torchvision DeepLabV3/ResNet50, with skip/residual branches, concatenation,
-BatchNorm, interpolation and structured outputs. CPU numerical and local TCP tests
+BatchNorm, interpolation and structured outputs. CPU numerical and TCP/UDP fault tests
 exercise these paths. Physical RTX 3050 tests include U-Net numerical parity,
 DeepLab execution, and a real U-Net baseline OOM overcome using a local multiprocess
 RAM fabric. Separate-machine RAM and longer hardware soak tests remain release
@@ -151,6 +152,32 @@ trainpool topology
 trainpool metrics --json
 ```
 
+### UDP versus persistent TCP data-plane benchmark
+
+Both nodes must use the same backend. Deliberately limit the compute node so
+strict local-first placement reaches the RAM-only peer, then run the same matrix
+once per backend. Sizes are decimal MB; 1024 MB is attempted only when capacity
+allows it. Keep the compute contribution larger than the transfer chunk/staging
+buffer but smaller than the smallest benchmark object (for the defaults, 32 MB
+is suitable: it admits a 16 MB chunk while a 64 MB object still goes remote).
+
+```sh
+# Both machines: choose udp (default) or tcp and restart their daemons.
+trainpool config set data-transport udp
+
+# Compute machine contribution for the default benchmark matrix.
+trainpool daemon --ram-limit-mib 32
+
+# Compute machine: after the two nodes are visible.
+PYTHONPATH=python .venv/bin/python scripts/benchmark_data_transport.py \
+  --label udp --sizes-mb 64 256 1024 --daemon-pid "$(pgrep -n trainpool)"
+```
+
+The JSON records verified bidirectional throughput, wall time, client and
+optional compute-daemon CPU, packet/retransmission counts, RTT/RTO,
+`network_wait_ms`, and persistent TCP open/reuse counts. Repeat with
+`data-transport=tcp`; do not compare runs made on different network paths.
+
 `metrics` reports the local node, grouped by job UUID; query each node for a complete
 experiment. `benchmark` asks the leader to measure all directed peer pairs. Ordinary
 heartbeats measure control RTT without sending bandwidth-test payloads.
@@ -262,15 +289,19 @@ and optional `config.toml`. `--data-dir` or `TRAINPOOL_HOME` selects another dir
 Never run two live installations with the same directory/node ID.
 
 ```sh
-trainpool config set ram-fraction 0.50
+trainpool config set ram-fraction 0.90
+trainpool config set ram-reserve-bytes 1000000000
+trainpool config set ram-reserve-fraction 0.10
+trainpool config set data-transport udp
 trainpool config set vram-reserve-bytes 536870912
 trainpool config set vram-reserve-fraction 0.05
 trainpool config set chunk-bytes 67108864
 trainpool config show
 ```
 
-Restart the daemon to apply configuration. RAM fractions must be 0.10–0.90; the default
-is exactly 0.50. Contribution ceilings can only reduce the budget.
+Restart the daemon to apply configuration. RAM fractions must be 0.10–0.90. The
+default ceiling is 0.90 after reserving the larger of 1 GB or 10% of physical RAM;
+an absolute contribution ceiling can only reduce the resulting budget.
 
 Set the same environment on participating daemons and SDK processes:
 
@@ -284,8 +315,9 @@ redacts the secret. The SDK reads `TRAINPOOL_ADDRESS`, `TRAINPOOL_CLUSTER_NAME` 
 `TRAINPOOL_CLUSTER_SECRET`; the launcher propagates these automatically. Python
 connects only to a loopback address, never directly to remote peers.
 
-This framed TCP MVP authenticates peers using challenge-response HMAC-SHA256 and signs
-discovery packets. **It does not encrypt traffic or provide per-user isolation.** Use
+Control and persistent reference data TCP authenticate peers using challenge-response
+HMAC-SHA256. Reliable UDP datagrams carry an HMAC-SHA256 tag, and discovery packets
+are signed. **Traffic is not encrypted and there is no per-user isolation.** Use
 an isolated trusted LAN or an encrypted VPN; all holders of the cluster secret are
 trusted. Without a secret, membership is intentionally open within the named cluster.
 Transport traits allow a later QUIC/TLS implementation.

@@ -211,10 +211,9 @@ def capture(model):
                 raise TrainPoolError(f"TRAINPOOL_UNSUPPORTED_OPERATOR: {node.name}: {node.target}")
         elif node.op not in ("placeholder", "output"):
             raise TrainPoolError(f"TRAINPOOL_UNSUPPORTED_GRAPH: {node.name}: {node.op}")
-    if used_parameters != {name for name, _ in parameters}:
-        raise TrainPoolError("TRAINPOOL_UNSUPPORTED_GRAPH: parameters outside captured module calls")
-    if missing := buffers.keys() - used_buffers:
-        raise TrainPoolError(f"TRAINPOOL_UNSUPPORTED_BUFFER: outside captured graph: {sorted(missing)}")
+    # FX intentionally omits registered modules and buffers that are unreachable
+    # from forward. GraphRuntime owns that dormant state for checkpoints and
+    # optimizer parameter ordering without materializing it during execution.
     return graph
 
 
@@ -377,6 +376,8 @@ class GraphRuntime(SequentialRuntime):
         self.records = {}
         self.state_names = tuple(model.state_dict())
         self.owner = model  # Replaced by a weak reference after installation.
+        model_parameters = dict(model.named_parameters())
+        model_buffers = dict(model.named_buffers())
         if self.device.type == "cuda":
             self.store.configure_gpu(self.device, budget)
         for index, group in enumerate(self.ir.groups):
@@ -394,6 +395,26 @@ class GraphRuntime(SequentialRuntime):
             # Release original leaf-module storage progressively, just as the
             # explicit adapter does; no full CPU state duplicate is retained here.
             group.module.to("meta")
+        active_buffers = {name for record in self.stages for name in record.buffers}
+        dormant_parameters = {
+            name: parameter for name, parameter in model_parameters.items() if name not in self.records
+        }
+        dormant_buffers = {
+            name: buffer for name, buffer in model_buffers.items() if name not in active_buffers
+        }
+        self.dormant = _Stage(
+            nn.Identity(),
+            {
+                name: store.offload(parameter, expected_next_use=None)
+                for name, parameter in dormant_parameters.items()
+            },
+            {name for name, parameter in dormant_parameters.items() if parameter.requires_grad},
+        )
+        self.dormant.buffers = {
+            name: store.offload(buffer, expected_next_use=None) for name, buffer in dormant_buffers.items()
+        }
+        for name in dormant_parameters:
+            self.records[name] = self.dormant
         model.to("meta")
         graph.to("meta")
         for group in self.ir.groups:
@@ -413,6 +434,11 @@ class GraphRuntime(SequentialRuntime):
             n.op == "call_function" and n.target in (F.dropout, F.dropout2d) for n in graph.graph.nodes
         )
 
+    def _state_records(self):
+        yield from self.stages
+        if self.dormant.weights or self.dormant.buffers:
+            yield self.dormant
+
     def named_training_parameters(self, *, device="cpu"):
         for name in self.parameter_order:
             yield name, self.store.restore(self.records[name].weights[name], device=device)
@@ -420,7 +446,7 @@ class GraphRuntime(SequentialRuntime):
     def convert_dtype(self, dtype):
         if self.pending:
             raise TrainPoolError("TRAINPOOL_UNSUPPORTED_GRAPH: dtype change during a pending step")
-        for record in self.stages:
+        for record in self._state_records():
             for table in (record.weights, record.buffers):
                 for name, handle in list(table.items()):
                     value = self.store.restore(handle, device="cpu")
@@ -547,7 +573,8 @@ class GraphRuntime(SequentialRuntime):
             states.update(record.optimizer_state)
             trainable.update(record.trainable)
         self.ir = make_ir(self.ir.frontend, chunks)
-        self.stages, self.records = [], {}
+        self.stages = []
+        self.records = {name: self.dormant for name in self.dormant.weights}
         for group in self.ir.groups:
             group.module.to("meta")
             group.module = copy.deepcopy(group.module)
@@ -865,7 +892,7 @@ class GraphRuntime(SequentialRuntime):
             destination = OrderedDict()
             destination._metadata = copy.deepcopy(self.state_metadata)
         state = {}
-        for record in self.stages:
+        for record in self._state_records():
             state.update(record.weights)
             state.update(record.buffers)
         for name in self.state_names:
@@ -882,7 +909,7 @@ class GraphRuntime(SequentialRuntime):
             raise RuntimeError(f"state_dict missing keys: {missing}; unexpected keys: {unexpected}")
         replacements = []
         try:
-            for record in self.stages:
+            for record in self._state_records():
                 for table in (record.weights, record.buffers):
                     for name, handle in table.items():
                         if name not in state_dict:

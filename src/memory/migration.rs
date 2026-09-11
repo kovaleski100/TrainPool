@@ -1,9 +1,6 @@
 use crate::{
     cluster::election::Leadership,
-    memory::{
-        block::{BlockState, Location, MemoryBlockHandle},
-        remote_ram,
-    },
+    memory::block::{BlockState, Location, MemoryBlockHandle},
     protocol::Request,
     runtime::Runtime,
     transport::Transport,
@@ -49,6 +46,7 @@ pub async fn migrate(
     target.checksum = None;
     target.lease_expires_ms = crate::now_ms() + runtime.config.lease_seconds * 1000;
     let address = node.network.control_address;
+    let data_address = node.network.data_address.unwrap_or(address);
     runtime
         .transport
         .control(
@@ -65,15 +63,34 @@ pub async fn migrate(
         let transfer = Uuid::new_v4();
         let chunk = runtime.config.chunk_bytes.min(node.network.chunk_bytes);
         for (index, bytes) in b.bytes.chunks(chunk).enumerate() {
-            remote_ram::write_chunk(
-                &runtime.transport,
-                address,
-                &target,
-                transfer,
-                (index * chunk) as u64,
-                bytes,
-            )
-            .await?;
+            if runtime.config.data_transport == "udp" && node.network.data_transport == "udp" {
+                let offset = (index * chunk) as u64;
+                {
+                    let mut all = runtime.metrics.lock().await;
+                    let metrics = all.job(handle.job_id);
+                    metrics.transfer_sessions += 1;
+                    metrics.active_transfer_sessions += 1;
+                }
+                let result = runtime
+                    .reliable_udp()
+                    .write(data_address, &target, transfer, offset, bytes)
+                    .await;
+                let mut all = runtime.metrics.lock().await;
+                let metrics = all.job(handle.job_id);
+                metrics.active_transfer_sessions =
+                    metrics.active_transfer_sessions.saturating_sub(1);
+                match result {
+                    Ok(stats) => runtime.apply_udp_stats(metrics, &stats),
+                    Err(error) => {
+                        metrics.failed_transfers += 1;
+                        return Err(error);
+                    }
+                }
+            } else {
+                runtime
+                    .tcp_write_chunk(address, &target, transfer, (index * chunk) as u64, bytes)
+                    .await?;
+            }
         }
         runtime
             .transport
@@ -139,6 +156,8 @@ pub async fn migrate(
     m.tensor_migrations += 1;
     m.bytes_local_to_remote_ram += handle.size;
     m.local_to_remote_bytes += handle.size;
+    m.network_bytes += handle.size;
+    m.network_wait_ms += start.elapsed().as_secs_f64() * 1000.0;
     m.migration_latency_ms += start.elapsed().as_secs_f64() * 1000.0;
     tracing::info!(block_id = %handle.id, source = %runtime.node_id, %destination, bytes = handle.size, "RAM migration committed");
     Ok(committed)

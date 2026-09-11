@@ -40,6 +40,8 @@ pub enum Command {
         seed: Vec<SocketAddr>,
         #[arg(long)]
         ram_limit_mib: Option<u64>,
+        #[arg(long, value_parser = ["tcp", "udp"])]
+        data_transport: Option<String>,
         #[arg(long)]
         enable_disk_spill: bool,
     },
@@ -85,10 +87,18 @@ pub async fn execute(cli: Cli) -> Result<()> {
             ConfigCommand::Set { key, value } => {
                 match key.as_str() {
                     "ram-fraction" => config.ram_fraction = value.parse()?,
+                    "ram-reserve-bytes" => config.ram_reserve_bytes = value.parse()?,
+                    "ram-reserve-fraction" => config.ram_reserve_fraction = value.parse()?,
                     "ram-limit-bytes" => config.ram_limit_bytes = Some(value.parse()?),
                     "cluster-name" => config.cluster_name = value,
                     "cluster-secret" => config.cluster_secret = Some(value),
                     "chunk-bytes" => config.chunk_bytes = value.parse()?,
+                    "data-transport" => config.data_transport = value,
+                    "udp-payload-bytes" => config.udp_payload_bytes = value.parse()?,
+                    "udp-window-packets" => config.udp_window_packets = value.parse()?,
+                    "udp-initial-rto-ms" => config.udp_initial_rto_ms = value.parse()?,
+                    "udp-pacing-micros" => config.udp_pacing_micros = value.parse()?,
+                    "udp-max-retries" => config.udp_max_retries = value.parse()?,
                     "lease-seconds" => config.lease_seconds = value.parse()?,
                     "vram-reserve-bytes" => config.vram_reserve_bytes = value.parse()?,
                     "vram-reserve-fraction" => config.vram_reserve_fraction = value.parse()?,
@@ -109,6 +119,7 @@ pub async fn execute(cli: Cli) -> Result<()> {
         no_discovery,
         seed,
         ram_limit_mib,
+        data_transport,
         enable_disk_spill,
     } = cli.command
     {
@@ -138,6 +149,9 @@ pub async fn execute(cli: Cli) -> Result<()> {
                     .checked_mul(1024 * 1024)
                     .ok_or_else(|| anyhow::anyhow!("RAM limit overflow"))?,
             );
+        }
+        if let Some(transport) = data_transport {
+            config.data_transport = transport;
         }
         config.validate()?;
         return crate::runtime::daemon(config, node_id(&cli.data_dir)?).await;
@@ -244,12 +258,15 @@ pub async fn execute(cli: Cli) -> Result<()> {
         let m = status.logical_memory;
         for (label, value) in [
             ("Cluster physical VRAM (inventory)", m.cluster_physical_vram),
-            ("Currently free GPU VRAM", m.free_vram),
+            ("GPU driver free (daemon snapshot)", m.free_vram),
+            (
+                "GPU driver used (daemon snapshot)",
+                m.physical_vram.saturating_sub(m.free_vram),
+            ),
             ("Cluster usable VRAM (inventory)", m.cluster_usable_vram),
             ("Primary GPU physical VRAM", m.primary_gpu_physical_vram),
-            ("Primary GPU usable VRAM", m.primary_gpu_usable_vram),
+            ("Primary GPU usable ceiling", m.primary_gpu_usable_vram),
             ("Job backing capacity", m.current_job_backing_capacity),
-            ("TrainPool allocated VRAM (SDK reports)", m.allocated_vram),
             ("Physical system RAM", m.physical_ram),
             ("Pool RAM budget", m.pool_ram_budget),
             ("Allocated pool RAM", m.allocated_ram),
@@ -261,11 +278,61 @@ pub async fn execute(cli: Cli) -> Result<()> {
         ] {
             println!("{label:<39} {}", format_bytes(value));
         }
+        println!("\nLOCAL COMPUTE-NODE RAM");
+        for (label, value) in [
+            ("Physical RAM local", m.local_physical_ram),
+            ("OS available RAM local", m.local_os_available_ram),
+            ("TrainPool local RAM budget", m.local_pool_ram_budget),
+            ("TrainPool local RAM used", m.local_pool_ram_used),
+            ("Local RAM safety reserve", m.local_ram_safety_reserve),
+            (
+                "TrainPool local RAM allocatable now",
+                m.local_pool_ram_allocatable,
+            ),
+            ("TrainPool remote RAM used", m.remote_pool_ram_used),
+        ] {
+            println!("{label:<39} {}", format_bytes(value));
+        }
+        println!("\nPYTORCH SDK CUDA SNAPSHOT");
+        let age = m.sdk_metrics_age_ms;
+        for (label, value) in [
+            ("GPU physical VRAM", m.sdk_physical_vram_bytes),
+            ("GPU driver used", m.driver_used_vram_bytes),
+            ("GPU driver free", m.driver_free_vram_bytes),
+            ("PyTorch allocated", m.torch_allocated_bytes),
+            ("PyTorch reserved", m.torch_reserved_bytes),
+            ("PyTorch reclaimable", m.torch_reclaimable_bytes),
+            (
+                "TrainPool resident handles",
+                m.trainpool_resident_vram_bytes,
+            ),
+            ("Safe VRAM allocatable now", m.safe_vram_allocatable_bytes),
+            (
+                "Configured usable VRAM ceiling",
+                m.configured_usable_vram_ceiling_bytes,
+            ),
+            (
+                "Configured VRAM safety reserve",
+                m.configured_vram_safety_reserve_bytes,
+            ),
+        ] {
+            println!("{label:<39} {}", format_sdk_metric(value, age));
+        }
         println!(
             "Disk spill: DISABLED\nLogical capacity combines distinct RAM and VRAM tiers; it is not one CUDA allocation or VRAM-speed memory."
         );
     }
     Ok(())
+}
+
+fn format_sdk_metric(value: Option<u64>, age_ms: Option<u64>) -> String {
+    match (value, age_ms) {
+        (Some(_), Some(age)) if age > 5_000 => {
+            format!("STALE (age {:.2} s)", age as f64 / 1000.0)
+        }
+        (Some(value), Some(age)) => format!("{} (age {age} ms)", format_bytes(value)),
+        _ => "UNKNOWN".into(),
+    }
 }
 fn format_bytes(bytes: u64) -> String {
     const UNITS: [(&str, u64); 4] = [
@@ -318,5 +385,15 @@ mod tests {
         assert_eq!(format_bytes(1_500_000), "1.50 MB");
         assert_eq!(format_bytes(16_659_828_736), "16.66 GB");
         assert_eq!(format_bytes(2_500_000_000_000), "2.50 TB");
+    }
+
+    #[test]
+    fn stale_sdk_metrics_are_never_rendered_as_zero() {
+        assert_eq!(format_sdk_metric(None, None), "UNKNOWN");
+        assert_eq!(
+            format_sdk_metric(Some(0), Some(12_400)),
+            "STALE (age 12.40 s)"
+        );
+        assert_eq!(format_sdk_metric(Some(0), Some(320)), "0 B (age 320 ms)");
     }
 }

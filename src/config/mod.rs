@@ -21,9 +21,19 @@ pub struct Config {
     pub discovery_enabled: bool,
     pub seeds: Vec<SocketAddr>,
     pub ram_fraction: f64,
+    pub ram_reserve_bytes: u64,
+    pub ram_reserve_fraction: f64,
     /// Optional absolute contribution ceiling, also useful for safe local demos.
     pub ram_limit_bytes: Option<u64>,
     pub chunk_bytes: usize,
+    /// Inter-node payload transport. Control and local SDK traffic remain TCP.
+    pub data_transport: String,
+    pub udp_payload_bytes: usize,
+    pub udp_window_packets: usize,
+    pub udp_initial_rto_ms: u64,
+    pub udp_pacing_micros: u64,
+    pub udp_max_retries: u32,
+    pub udp_max_sessions: usize,
     pub lease_seconds: u64,
     pub vram_reserve_bytes: u64,
     pub vram_reserve_fraction: f64,
@@ -48,9 +58,18 @@ impl Default for Config {
             multicast_interface: Ipv4Addr::UNSPECIFIED,
             discovery_enabled: true,
             seeds: vec![],
-            ram_fraction: 0.50,
+            ram_fraction: 0.90,
+            ram_reserve_bytes: 1024 * MIB,
+            ram_reserve_fraction: 0.10,
             ram_limit_bytes: None,
             chunk_bytes: (64 * MIB) as usize,
+            data_transport: "udp".into(),
+            udp_payload_bytes: 1200,
+            udp_window_packets: 64,
+            udp_initial_rto_ms: 50,
+            udp_pacing_micros: 20,
+            udp_max_retries: 8,
+            udp_max_sessions: 128,
             lease_seconds: 300,
             // A small non-zero floor protects CUDA context/workspaces on small
             // GPUs; the fractional component grows adaptively on larger cards.
@@ -68,8 +87,40 @@ impl Config {
             "ram-fraction must be between 0.10 and 0.90"
         );
         ensure!(
+            (0.0..=0.90).contains(&self.ram_reserve_fraction),
+            "invalid RAM reserve fraction"
+        );
+        ensure!(
             (4096..=64 * MIB as usize).contains(&self.chunk_bytes),
             "chunk-bytes must be 4096..67108864"
+        );
+        ensure!(
+            matches!(self.data_transport.as_str(), "tcp" | "udp"),
+            "data-transport must be tcp or udp"
+        );
+        ensure!(
+            (512..=1200).contains(&self.udp_payload_bytes),
+            "udp-payload-bytes must be 512..1200"
+        );
+        ensure!(
+            (2..=256).contains(&self.udp_window_packets),
+            "udp-window-packets must be 2..256"
+        );
+        ensure!(
+            (10..=5000).contains(&self.udp_initial_rto_ms),
+            "udp-initial-rto-ms must be 10..5000"
+        );
+        ensure!(
+            (1..=100_000).contains(&self.udp_pacing_micros),
+            "udp-pacing-micros must be 1..100000"
+        );
+        ensure!(
+            (1..=64).contains(&self.udp_max_retries),
+            "udp-max-retries must be 1..64"
+        );
+        ensure!(
+            (1..=4096).contains(&self.udp_max_sessions),
+            "udp-max-sessions must be 1..4096"
         );
         ensure!(
             (10..=86400).contains(&self.lease_seconds),

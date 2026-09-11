@@ -32,6 +32,30 @@ class ResidencyCandidate:
     reuse_count: int = 0
 
 
+@dataclasses.dataclass(frozen=True)
+class CudaMemorySnapshot:
+    physical_total: int
+    driver_free: int
+    driver_used: int
+    torch_allocated: int
+    torch_reserved: int
+    torch_reclaimable: int
+    trainpool_resident: int
+    configured_usable_ceiling: int
+    configured_safety_reserve: int
+    physical_allocator_headroom: int
+    budget_headroom: int
+    safe_allocatable_now: int
+
+    def diagnostic(self):
+        return (
+            f"driver_free={self.driver_free} torch_allocated={self.torch_allocated} "
+            f"torch_reserved={self.torch_reserved} reclaimable_cache={self.torch_reclaimable} "
+            f"trainpool_resident={self.trainpool_resident} "
+            f"safe_allocatable={self.safe_allocatable_now}"
+        )
+
+
 class TieredResidencyPolicy:
     """Deterministic policy shared by the real store and simulation tests.
 
@@ -126,8 +150,11 @@ class TensorStore:
         self._lease_error = None
         self._gpu_device = None
         self._gpu_budget_bytes = 0
+        self._gpu_safety_reserve_bytes = 0
         self._resident_bytes = 0
         self._access_index = 0
+        self._last_metrics_flush = 0.0
+        self._metrics_interval_seconds = 0.250
         local_budget = self.plan.get("memory_budgets", {}).get(self.client.local_node, 0)
         self.policy = TieredResidencyPolicy(0, local_budget)
         self.metrics = {
@@ -170,6 +197,12 @@ class TensorStore:
         target = torch.device(device)
         self._require_cuda(target)
         self._gpu_budget_bytes = max(0, int(budget_bytes or 0))
+        assignment = next(
+            assignment
+            for assignment in self.plan["gpu_assignments"]
+            if assignment["node_id"] == self.client.local_node
+        )
+        self._gpu_safety_reserve_bytes = int(assignment.get("safety_reserve_bytes", 0))
         self.policy = TieredResidencyPolicy(
             self._gpu_budget_bytes,
             self.policy.local_ram_capacity,
@@ -209,13 +242,47 @@ class TensorStore:
     def _effective_vram_capacity(self):
         if self._gpu_device is None or not self._gpu_budget_bytes:
             return 0
+        snapshot = self.cuda_memory_snapshot()
+        # Existing TrainPool residents are a subset of torch_allocated. Adding
+        # only safe *new* allocator headroom yields a maximum resident ceiling
+        # without counting cached or resident bytes twice.
+        return min(
+            self._gpu_budget_bytes,
+            self._resident_bytes + snapshot.safe_allocatable_now,
+        )
+
+    def cuda_memory_snapshot(self):
+        """Return the authoritative, process-local CUDA allocator snapshot.
+
+        Driver free bytes exclude PyTorch's reserved cache. Reclaimable cache is
+        therefore added only to physical headroom, while budget headroom is
+        derived from total PyTorch allocation. TrainPool resident handles are a
+        subset of torch_allocated and are never added to either side.
+        """
+        if self._gpu_device is None:
+            return None
         import torch
 
-        free, _total = torch.cuda.mem_get_info(self._gpu_device)
-        # The daemon budget already excludes the adaptive CUDA safety reserve.
-        # Add owned residency back to physical free to obtain a stable ceiling,
-        # while reacting immediately if another CUDA consumer creates pressure.
-        return min(self._gpu_budget_bytes, self._resident_bytes + free)
+        driver_free, physical_total = torch.cuda.mem_get_info(self._gpu_device)
+        allocated = torch.cuda.memory_allocated(self._gpu_device)
+        reserved = torch.cuda.memory_reserved(self._gpu_device)
+        reclaimable = max(0, reserved - allocated)
+        physical_headroom = driver_free + reclaimable
+        budget_headroom = max(0, self._gpu_budget_bytes - allocated)
+        return CudaMemorySnapshot(
+            physical_total=physical_total,
+            driver_free=driver_free,
+            driver_used=physical_total - driver_free,
+            torch_allocated=allocated,
+            torch_reserved=reserved,
+            torch_reclaimable=reclaimable,
+            trainpool_resident=self._resident_bytes,
+            configured_usable_ceiling=self._gpu_budget_bytes,
+            configured_safety_reserve=self._gpu_safety_reserve_bytes,
+            physical_allocator_headroom=physical_headroom,
+            budget_headroom=budget_headroom,
+            safe_allocatable_now=min(physical_headroom, budget_headroom),
+        )
 
     def _resident_candidates(self, *, exclude=()):
         excluded = {handle.id for handle in exclude}
@@ -230,24 +297,47 @@ class TensorStore:
             self.metrics["peak_vram_resident_bytes"], self._resident_bytes
         )
 
-    def ensure_cuda_capacity(self, bytes_needed, *, protected=()):
+    def ensure_cuda_capacity(self, bytes_needed, *, protected=(), context=None):
         """Evict cold values until a transient CUDA working set can fit."""
         if self._gpu_device is None:
             return
-        capacity = self._effective_vram_capacity()
-        needed = max(0, self._resident_bytes + int(bytes_needed) - capacity)
-        if not needed:
-            return
-        selected = self.policy.select_evictions(
-            self._resident_candidates(exclude=protected), needed, self._access_index
+        protected_resident = sum(
+            handle.size
+            for handle in {handle.id: handle for handle in protected}.values()
+            if handle.resident is not None
         )
-        if not selected:
-            raise TrainPoolError(
-                f"TRAINPOOL_UNSUPPORTED_WORKING_SET: need {bytes_needed} CUDA bytes with "
-                f"{self._resident_bytes} resident and {capacity} available"
+        additional = max(0, int(bytes_needed) - protected_resident)
+        while True:
+            snapshot = self.cuda_memory_snapshot()
+            if snapshot.safe_allocatable_now >= additional:
+                return snapshot
+            shortage = additional - snapshot.safe_allocatable_now
+            selected = self.policy.select_evictions(
+                self._resident_candidates(exclude=protected), shortage, self._access_index
             )
-        for candidate in selected:
-            self._spill(self.tensors[candidate.id])
+            if not selected:
+                detail = f" {context}" if context else ""
+                raise TrainPoolError(
+                    f"TRAINPOOL_UNSUPPORTED_WORKING_SET:{detail} required={bytes_needed} "
+                    f"additional={additional} {snapshot.diagnostic()}"
+                )
+            for candidate in selected:
+                self._spill(self.tensors[candidate.id])
+
+    def prepare_transient(self, handles):
+        """Make optimizer inputs durable and nonresident before transient restore.
+
+        A normal CUDA restore may promote a handle and retain the restored value.
+        Optimizer inputs must instead have exactly one live CUDA copy, while the
+        old transactional version remains recoverable in RAM until publication.
+        """
+        with self._lock:
+            for handle in handles:
+                if handle.resident is not None:
+                    self._spill(handle)
+
+    def restore_transient(self, handle, *, device=None):
+        return self.restore(handle, device=device, retain=False)
 
     def _try_retain(self, value, handle):
         import torch
@@ -397,7 +487,14 @@ class TensorStore:
         self.metrics["eviction_count"] += 1
         del resident
 
-    def offload(self, tensor, *, expected_next_use=None, remaining_consumers=1):
+    def offload(
+        self,
+        tensor,
+        *,
+        expected_next_use=None,
+        remaining_consumers=1,
+        allow_vram=True,
+    ):
         import torch
 
         self._check()
@@ -421,7 +518,7 @@ class TensorStore:
         with self._lock:
             self.tensors[handle.id] = handle
         try:
-            if self._try_retain(value, handle):
+            if allow_vram and self._try_retain(value, handle):
                 if tensor.device.type == "cpu":
                     self.metrics["bytes_local_ram_to_gpu"] += handle.size
                     self.metrics["local_to_gpu_bytes"] += handle.size
@@ -445,7 +542,7 @@ class TensorStore:
                 self.free(handle)
             raise
 
-    def restore(self, handle, *, device=None):
+    def restore(self, handle, *, device=None, retain=True):
         import torch
 
         self._check()
@@ -493,7 +590,8 @@ class TensorStore:
             # Promotion is a move: after a successful RAM -> VRAM restore, the
             # backing allocation is released instead of becoming a replica.
             if (
-                target.type == "cuda"
+                retain
+                and target.type == "cuda"
                 and self._resident_bytes + handle.size <= self._effective_vram_capacity()
             ):
                 handle.resident = result
@@ -502,6 +600,19 @@ class TensorStore:
                 self._drop_blocks(handle)
                 return result.detach().clone()
         return result
+
+    def transactional_offload(self, tensor, *, expected_next_use=None):
+        """Publish replacement state without requiring a second VRAM copy.
+
+        Optimizer transactions retain the old handle until all replacements are
+        durable. The replacement is therefore staged in RAM and can be promoted
+        on its next use after the old ownership has been released.
+        """
+        return self.offload(
+            tensor,
+            expected_next_use=expected_next_use,
+            allow_vram=False,
+        )
 
     def free(self, handle):
         with self._lock:
@@ -513,7 +624,10 @@ class TensorStore:
                 self._resident_bytes -= handle.size
             self.tensors.pop(handle.id)
 
-    def flush_metrics(self):
+    def flush_metrics(self, *, force=False):
+        now = time.monotonic()
+        if not force and now - self._last_metrics_flush < self._metrics_interval_seconds:
+            return False
         with self._lock:
             metrics = dict(self.metrics)
             local, remote = self._backing_totals()
@@ -532,6 +646,21 @@ class TensorStore:
                     for g in self.plan["gpu_assignments"]
                     if g["node_id"] == self.client.local_node
                 )
+                snapshot = self.cuda_memory_snapshot()
+                metrics.update(
+                    {
+                        "physical_vram_bytes": snapshot.physical_total,
+                        "driver_free_vram_bytes": snapshot.driver_free,
+                        "driver_used_vram_bytes": snapshot.driver_used,
+                        "torch_allocated_bytes": snapshot.torch_allocated,
+                        "torch_reserved_bytes": snapshot.torch_reserved,
+                        "torch_reclaimable_bytes": snapshot.torch_reclaimable,
+                        "safe_vram_allocatable_bytes": snapshot.safe_allocatable_now,
+                        "configured_usable_vram_ceiling_bytes": snapshot.configured_usable_ceiling,
+                        "configured_vram_safety_reserve_bytes": snapshot.configured_safety_reserve,
+                    }
+                )
+            metrics["sdk_metrics_timestamp_ms"] = int(time.time() * 1000)
             # Rust uses explicit fields; unspecified counters are filled with zeros.
             defaults = {
                 "tensor_allocations": 0,
@@ -548,16 +677,22 @@ class TensorStore:
                 "local_to_remote_bytes": 0,
             }
             self.client.control("report_metrics", job_id=self.job_id, metrics={**defaults, **metrics})
+            self._last_metrics_flush = time.monotonic()
             for key in self.metrics:
                 self.metrics[key] = 0
+        return True
 
     def close(self):
         if self._closed.is_set():
             return
         self._closed.set()
-        self._renewal.join(timeout=self.client.timeout + 1)
+        # A weakref finalizer may run on the lease thread when that thread
+        # releases the last reference to a model/runtime. Joining the current
+        # thread raises RuntimeError and would skip durable-handle cleanup.
+        if threading.current_thread() is not self._renewal:
+            self._renewal.join(timeout=self.client.timeout + 1)
         try:
-            self.flush_metrics()
+            self.flush_metrics(force=True)
         finally:
             for handle in list(self.tensors.values()):
                 try:
@@ -569,7 +704,7 @@ class TensorStore:
             # Send zero current-tier gauges after releasing ownership. Counter
             # deltas were already reported by the first flush above.
             with contextlib.suppress(Exception):
-                self.flush_metrics()
+                self.flush_metrics(force=True)
 
     def __enter__(self):
         return self
