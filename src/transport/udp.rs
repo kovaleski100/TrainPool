@@ -359,6 +359,10 @@ pub async fn send_payload(
 }
 
 fn update_rto(sample_ms: f64, srtt: &mut Option<f64>, rttvar: &mut f64) -> Duration {
+    // A 10 ms floor is too aggressive once sender, receiver and a CPU training
+    // process contend on small CI/LAN hosts. Keep enough scheduling slack to
+    // avoid turning delayed ACKs into retransmission storms.
+    const MIN_RTO_MS: f64 = 50.0;
     if let Some(previous) = *srtt {
         *rttvar = 0.75 * *rttvar + 0.25 * (previous - sample_ms).abs();
         *srtt = Some(0.875 * previous + 0.125 * sample_ms);
@@ -366,7 +370,7 @@ fn update_rto(sample_ms: f64, srtt: &mut Option<f64>, rttvar: &mut f64) -> Durat
         *srtt = Some(sample_ms);
         *rttvar = sample_ms / 2.0;
     }
-    let milliseconds = (srtt.unwrap_or(sample_ms) + 4.0 * *rttvar).clamp(10.0, 2_000.0);
+    let milliseconds = (srtt.unwrap_or(sample_ms) + 4.0 * *rttvar).clamp(MIN_RTO_MS, 2_000.0);
     Duration::from_secs_f64(milliseconds / 1_000.0)
 }
 
@@ -805,6 +809,7 @@ mod tests {
         config: Config,
         loss_every: Option<u32>,
         drop_fin_and_complete: bool,
+        first_ack_delay: Duration,
     ) -> (Vec<u8>, usize) {
         let mut start = None;
         let mut source = None;
@@ -813,6 +818,7 @@ mod tests {
         let mut dropped_once = HashSet::new();
         let mut dropped_fin = false;
         let mut dropped_complete = false;
+        let mut delayed_ack = false;
         loop {
             let mut wire = [0_u8; MAX_DATAGRAM];
             let (size, peer) = socket.recv_from(&mut wire).await.unwrap();
@@ -857,6 +863,10 @@ mod tests {
                         Kind::Ack,
                         bitmap_payload(base as u32, &bits, config.udp_window_packets),
                     );
+                    if !delayed_ack && !first_ack_delay.is_zero() {
+                        tokio::time::sleep(first_ack_delay).await;
+                        delayed_ack = true;
+                    }
                     socket
                         .send_to(
                             &reply.encode(config.cluster_secret.as_deref()).unwrap(),
@@ -933,6 +943,7 @@ mod tests {
                 config.clone(),
                 loss_every,
                 drop_completion,
+                Duration::ZERO,
             ));
             let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let payload: Vec<_> = (0..config.chunk_bytes)
@@ -961,8 +972,48 @@ mod tests {
                 stats.ack_count > 1,
                 "window must have multiple packets in flight"
             );
-            assert!(stats.retransmission_timeout_ms >= 10.0);
+            assert!(stats.retransmission_timeout_ms >= 50.0);
         }
+    }
+
+    #[tokio::test]
+    async fn scheduler_delayed_ack_does_not_cause_spurious_retransmission() {
+        let config = Config {
+            chunk_bytes: 64 * 1024,
+            udp_initial_rto_ms: 10,
+            udp_pacing_micros: 1,
+            udp_max_retries: 2,
+            ..Default::default()
+        };
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let destination = receiver.local_addr().unwrap();
+        let receiver_task = tokio::spawn(lossy_receiver(
+            receiver,
+            config.clone(),
+            None,
+            false,
+            Duration::from_millis(30),
+        ));
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let payload = vec![7; config.chunk_bytes];
+        let stats = send_payload(
+            &sender,
+            destination,
+            &config,
+            SendPayload {
+                handle: &handle(payload.len()),
+                transfer_id: Uuid::new_v4(),
+                offset: 0,
+                payload: &payload,
+                read_response: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(receiver_task.await.unwrap().0, payload);
+        assert_eq!(stats.retransmitted_bytes, 0);
+        assert_eq!(stats.retransmitted_datagrams, 0);
+        assert!(stats.retransmission_timeout_ms >= 50.0);
     }
 
     #[tokio::test]

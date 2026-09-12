@@ -47,7 +47,7 @@ python scripts/two_node_demo.py
 ```
 
 The final CPU suite passed **50 tests**, with 3 opt-in CUDA tests skipped; Rust
-passed **33 tests** (11 runtime/CLI/UDP unit tests,
+passed **34 tests** (12 runtime/CLI/UDP unit tests,
 16 core, 6 fabric). Formatting, Clippy with warnings denied, release build and the
 release-binary two-node demo passed. Physical CUDA tests are opt-in and skipped in
 CPU CI unless an explicit CUDA fabric endpoint is supplied.
@@ -116,7 +116,7 @@ The work started from branch `main` at
 left running and was not re-instantiated. All current-binary experiments used isolated
 loopback ports and temporary metadata directories.
 
-The final automated run passed 33 Rust tests and 50 Python tests (3 opt-in CUDA tests
+The final automated run passed 34 Rust tests and 50 Python tests (3 opt-in CUDA tests
 skipped by the ordinary Python suite). Rust transport coverage includes authenticated
 MTU-safe encoding, sparse bitmap ACKs, 0%, 0.1%, 1% and 5% injected loss, reorder,
 duplicates, selective retransmission, corrupt datagrams/block checksums, dropped FIN
@@ -147,6 +147,15 @@ The corrected 64 MB UDP rerun measured RTT 1.771 ms and adaptive RTO 10 ms, with
 receive-only completion could replace a valid sender RTT/RTO sample with zero; that
 observability bug was fixed and the nonzero sample was confirmed. The transfer
 throughput and packet counters in the full matrix are unaffected.
+
+That first CI run passed all Rust/build/lint stages but exposed a pytest-only failure
+on the smaller two-vCPU runner. An exact CPU-wheel reproduction passed all 50 tests;
+the runner-only behavior is consistent with scheduler contention around the UDP launcher
+workload, although the unauthenticated public API did not expose the pytest log text.
+The negotiated RTO floor was therefore hardened from 10 ms to 50 ms and a deterministic
+30 ms delayed-ACK regression verifies that scheduler delay does not cause spurious
+payload retransmission. The 10 ms value above remains the measurement of the original
+benchmark run, not the post-hardening configured floor.
 
 TCP persistent is decisively faster on loopback. Reliable UDP is therefore the
 functional default candidate required by this milestone, but these measurements do

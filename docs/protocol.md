@@ -36,7 +36,8 @@ to 256 packets), per-datagram pacing and bitmap ACK/NACK messages. Arrival order
 irrelevant: the receiver validates each packet and copies it to its declared offset in
 a bounded staging buffer. Received bitmap entries are retained and only missing
 sequences are retransmitted. RTT uses an EWMA with variance; RTO is bounded to
-10–2000 ms. Loss applies pacing backoff and multiplicative window decrease. Retry
+50–2000 ms after negotiation, leaving scheduler slack when training and networking
+contend on small hosts. Loss applies pacing backoff and multiplicative window decrease. Retry
 exhaustion sends ABORT and fails explicitly.
 
 The receiver bounds concurrent write and read sessions, reserves each staging buffer
