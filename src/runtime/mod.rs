@@ -300,7 +300,8 @@ pub async fn start_runtime(config: Config, id: Uuid) -> Result<RuntimeHandle> {
     } else {
         None
     };
-    tracing::info!(node_id = %id, address = %runtime.local().await.network.control_address, gpu_compute = runtime.local().await.runtime.gpu_compute, "TrainPool daemon ready; disk spill disabled");
+    let local = runtime.local().await;
+    tracing::info!(node_id = %id, address = %local.network.control_address, gpu_compute = local.runtime.gpu_compute, "TrainPool daemon ready; disk spill disabled");
     let monitor = tokio::spawn(runtime.clone().monitor(discovery.clone()));
     let receiver = discovery.map(|d| tokio::spawn(runtime.clone().discover(d)));
     let server = tokio::spawn(runtime.clone().serve(listener));

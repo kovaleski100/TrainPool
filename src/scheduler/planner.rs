@@ -57,35 +57,34 @@ impl TrainingPlanner for CapacityPlanner {
         topology: &Topology,
         stages: &[StageSpec],
     ) -> Result<TrainingPlan> {
-        let mut gpus: Vec<_> = nodes
+        let primary = nodes
             .iter()
             .filter(|n| n.runtime.gpu_compute)
             .flat_map(|n| {
                 n.gpus
                     .iter()
                     .filter(|g| g.usable_vram > 0)
-                    .map(|g| GpuAssignment {
-                        node_id: n.node_id,
-                        gpu_id: g.uuid.clone(),
-                        usable_bytes: g.usable_vram,
-                        safety_reserve_bytes: g.vram_free.saturating_sub(g.usable_vram),
-                        capacity_share: 0.0,
-                    })
+                    .map(move |g| (n.node_id, g))
             })
-            .collect();
-        gpus.sort_by(|a, b| {
-            b.usable_bytes
-                .cmp(&a.usable_bytes)
-                .then(a.gpu_id.cmp(&b.gpu_id))
-                .then(a.node_id.cmp(&b.node_id))
-        });
+            .min_by(|(a_node, a), (b_node, b)| {
+                b.usable_vram
+                    .cmp(&a.usable_vram)
+                    .then(a.uuid.cmp(&b.uuid))
+                    .then(a_node.cmp(b_node))
+            });
         // Every v1 plan uses exactly one compute GPU, including explicit stages.
         // Additional GPUs remain cluster resources, but are not presented as if
         // their VRAM participated in this job.
-        if !gpus.is_empty() {
-            gpus.truncate(1);
-            gpus[0].capacity_share = 1.0;
-        }
+        let gpus: Vec<_> = primary
+            .into_iter()
+            .map(|(node_id, gpu)| GpuAssignment {
+                node_id,
+                gpu_id: gpu.uuid.clone(),
+                usable_bytes: gpu.usable_vram,
+                safety_reserve_bytes: gpu.vram_free.saturating_sub(gpu.usable_vram),
+                capacity_share: 1.0,
+            })
+            .collect();
         if !stages.is_empty() && gpus.is_empty() {
             anyhow::bail!("TRAINPOOL_NO_CUDA: no eligible primary GPU");
         }
@@ -106,9 +105,10 @@ impl TrainingPlanner for CapacityPlanner {
                 gpu_id: gpu.gpu_id.clone(),
             });
         }
-        let mut compute_nodes: Vec<_> = gpus.iter().map(|g| g.node_id).collect();
-        compute_nodes.sort();
-        compute_nodes.dedup();
+        let compute_nodes = gpus
+            .first()
+            .map(|gpu| vec![gpu.node_id])
+            .unwrap_or_default();
         let count = gpus.len();
         Ok(TrainingPlan {
             job_id: Uuid::new_v4(),

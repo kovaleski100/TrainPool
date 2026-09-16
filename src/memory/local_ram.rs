@@ -115,17 +115,12 @@ impl LocalRam {
     }
     pub async fn expire(&self) {
         let mut blocks = self.blocks.lock().await;
-        let mut expired = vec![];
-        for (id, block) in blocks.iter() {
-            if let Ok(b) = block.try_lock()
-                && b.handle.lease_expires_ms <= crate::now_ms()
-                && b.handle.state != BlockState::Migrating
-            {
-                expired.push(*id);
-            }
-        }
-        for id in expired {
-            blocks.remove(&id);
-        }
+        let now = crate::now_ms();
+        blocks.retain(|_, block| {
+            let Ok(b) = block.try_lock() else {
+                return true;
+            };
+            b.handle.lease_expires_ms > now || b.handle.state == BlockState::Migrating
+        });
     }
 }

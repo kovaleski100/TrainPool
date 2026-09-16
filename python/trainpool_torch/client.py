@@ -145,11 +145,11 @@ class Client:
         try:
             digest = blake3.blake3()
             offset = 0
-            for data in chunks:
-                chunk = memoryview(data).cast("B")
-                if not chunk or len(chunk) > self.chunk_bytes or offset + len(chunk) > size:
-                    raise ValueError("invalid streamed upload chunk")
-                with self.connect() as sock:
+            with self.connect() as sock:
+                for data in chunks:
+                    chunk = memoryview(data).cast("B")
+                    if not chunk or len(chunk) > self.chunk_bytes or offset + len(chunk) > size:
+                        raise ValueError("invalid streamed upload chunk")
                     _write_frame(
                         sock,
                         {
@@ -166,17 +166,15 @@ class Client:
                     _check(_read_frame(sock))
                     sock.sendall(chunk)
                     _check(_read_frame(sock))
-                digest.update(chunk)
-                offset += len(chunk)
-                del chunk, data
+                    digest.update(chunk)
+                    offset += len(chunk)
+                    del chunk, data
             if offset != size:
                 raise ValueError("streamed upload size mismatch")
             return self.control("commit", handle=handle, checksum=digest.hexdigest(), direct=False)
         except BaseException:
-            try:
+            with contextlib.suppress(TrainPoolError):
                 self.control("free", handle=handle, direct=False)
-            except TrainPoolError:
-                pass
             raise
 
     def read_into(self, handle, buffer):
@@ -185,9 +183,9 @@ class Client:
             raise ValueError("destination length differs from block size")
         digest = blake3.blake3()
         transfer = str(uuid.uuid4())
-        for offset in range(0, len(view), self.chunk_bytes):
-            chunk = view[offset : offset + self.chunk_bytes]
-            with self.connect() as sock:
+        with self.connect() as sock:
+            for offset in range(0, len(view), self.chunk_bytes):
+                chunk = view[offset : offset + self.chunk_bytes]
                 _write_frame(
                     sock,
                     {
@@ -211,7 +209,7 @@ class Client:
                 _receive_into(sock, chunk)
                 if blake3.blake3(chunk).hexdigest() != metadata["checksum"]:
                     raise TrainPoolError("TRAINPOOL_CHECKSUM_MISMATCH")
-            digest.update(chunk)
+                digest.update(chunk)
         if digest.hexdigest() != handle["checksum"]:
             raise TrainPoolError("TRAINPOOL_CHECKSUM_MISMATCH: complete block")
 
@@ -224,35 +222,35 @@ class Client:
         digest = blake3.blake3()
         transfer = str(uuid.uuid4())
         chunk_bytes = min(chunk_bytes, self.chunk_bytes)
-        for offset in range(0, handle["size"], chunk_bytes):
-            length = min(chunk_bytes, handle["size"] - offset)
-            with self.staging(length):
+        reservation = min(chunk_bytes, handle["size"])
+        with self.staging(reservation), self.connect() as sock:
+            for offset in range(0, handle["size"], chunk_bytes):
+                length = min(chunk_bytes, handle["size"] - offset)
                 buffer = bytearray(length)
-                with self.connect() as sock:
-                    _write_frame(
-                        sock,
-                        {
-                            "op": "read_chunk",
-                            "handle": handle,
-                            "transfer_id": transfer,
-                            "offset": offset,
-                            "length": length,
-                            "direct": False,
-                        },
-                    )
-                    metadata = _check(_read_frame(sock))
-                    expected = {
+                _write_frame(
+                    sock,
+                    {
+                        "op": "read_chunk",
+                        "handle": handle,
                         "transfer_id": transfer,
-                        "object_id": handle["id"],
                         "offset": offset,
                         "length": length,
-                        "total_size": handle["size"],
-                    }
-                    if any(metadata[key] != value for key, value in expected.items()):
-                        raise TrainPoolError("invalid transfer metadata")
-                    _receive_into(sock, buffer)
-                    if blake3.blake3(buffer).hexdigest() != metadata["checksum"]:
-                        raise TrainPoolError("TRAINPOOL_CHECKSUM_MISMATCH")
+                        "direct": False,
+                    },
+                )
+                metadata = _check(_read_frame(sock))
+                expected = {
+                    "transfer_id": transfer,
+                    "object_id": handle["id"],
+                    "offset": offset,
+                    "length": length,
+                    "total_size": handle["size"],
+                }
+                if any(metadata[key] != value for key, value in expected.items()):
+                    raise TrainPoolError("invalid transfer metadata")
+                _receive_into(sock, buffer)
+                if blake3.blake3(buffer).hexdigest() != metadata["checksum"]:
+                    raise TrainPoolError("TRAINPOOL_CHECKSUM_MISMATCH")
                 digest.update(buffer)
                 yield buffer
                 del buffer

@@ -372,9 +372,11 @@ class GraphRuntime(SequentialRuntime):
         self.ir = partition(graph, budget)
         self.signature = inspect.signature(model.forward)
         self.parameter_order = tuple(name for name, _ in model.named_parameters())
-        self.state_metadata = copy.deepcopy(getattr(model.state_dict(), "_metadata", {}))
+        self.state_metadata = copy.deepcopy(
+            getattr(state := model.state_dict(), "_metadata", {})
+        )
         self.records = {}
-        self.state_names = tuple(model.state_dict())
+        self.state_names = tuple(state)
         self.owner = model  # Replaced by a weak reference after installation.
         model_parameters = dict(model.named_parameters())
         model_buffers = dict(model.named_buffers())
@@ -615,8 +617,7 @@ class GraphRuntime(SequentialRuntime):
                     self._repartition(chunks)
                     retry = True
                     break
-                for name, value in zip(group.outputs, result, strict=True):
-                    env[name] = value
+                env.update(zip(group.outputs, result, strict=True))
             if not retry:
                 flatten(fx.node.map_arg(self.ir.output, lambda node, env=env: env[node.name]))
                 return

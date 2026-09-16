@@ -249,6 +249,7 @@ impl Runtime {
         };
         let leadership = self.leadership().await;
         let mut moved = 0;
+        let now = crate::now_ms();
         let mut blocks: Vec<_> = self
             .residency
             .read()
@@ -256,9 +257,7 @@ impl Runtime {
             .blocks
             .values()
             .filter(|b| {
-                b.owner_node == source
-                    && b.state == BlockState::Ready
-                    && b.lease_expires_ms > crate::now_ms()
+                b.owner_node == source && b.state == BlockState::Ready && b.lease_expires_ms > now
             })
             .cloned()
             .collect();

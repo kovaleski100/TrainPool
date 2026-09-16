@@ -153,12 +153,13 @@ pub async fn migrate(
     runtime.ram.free(handle.id, handle.lease_token).await?;
     let mut metrics = runtime.metrics.lock().await;
     let m = metrics.job(handle.job_id);
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
     m.tensor_migrations += 1;
     m.bytes_local_to_remote_ram += handle.size;
     m.local_to_remote_bytes += handle.size;
     m.network_bytes += handle.size;
-    m.network_wait_ms += start.elapsed().as_secs_f64() * 1000.0;
-    m.migration_latency_ms += start.elapsed().as_secs_f64() * 1000.0;
+    m.network_wait_ms += elapsed_ms;
+    m.migration_latency_ms += elapsed_ms;
     tracing::info!(block_id = %handle.id, source = %runtime.node_id, %destination, bytes = handle.size, "RAM migration committed");
     Ok(committed)
 }

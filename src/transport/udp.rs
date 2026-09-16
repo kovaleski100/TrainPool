@@ -623,6 +623,7 @@ async fn receive_payload(
     );
     let mut buffer = vec![0; length];
     let mut received = vec![false; packet_count];
+    let mut received_count = 0_usize;
     let mut stats = TransferStats::default();
     let mut ack = Packet::for_handle(Kind::StartAck, handle, start.transfer_id);
     ack.flags = 1;
@@ -675,12 +676,11 @@ async fn receive_payload(
                     }
                     buffer[begin..begin + packet.payload.len()].copy_from_slice(&packet.payload);
                     received[sequence] = true;
+                    received_count += 1;
                     stats.payload_bytes += packet.payload.len() as u64;
                     last_sequence = Some(sequence);
                 }
-                if received.iter().filter(|value| **value).count() % 8 == 0
-                    || received.iter().all(|value| *value)
-                {
+                if received_count.is_multiple_of(8) || received_count == packet_count {
                     let base = (sequence / ACK_BITS) * ACK_BITS;
                     let bits: Vec<_> = (base..base + ACK_BITS)
                         .map(|index| received.get(index).copied().unwrap_or(false))
@@ -695,7 +695,7 @@ async fn receive_payload(
                     stats.ack_count += 1;
                 }
             }
-            Kind::Fin if received.iter().all(|value| *value) => {
+            Kind::Fin if received_count == packet_count => {
                 ensure!(
                     packet.payload == start.payload[8..],
                     "UDP FIN checksum changed"

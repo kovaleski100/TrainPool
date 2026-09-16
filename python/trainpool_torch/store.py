@@ -153,6 +153,7 @@ class TensorStore:
         self._gpu_safety_reserve_bytes = 0
         self._resident_bytes = 0
         self._access_index = 0
+        self._last_job_check = time.monotonic()
         self._last_metrics_flush = 0.0
         self._metrics_interval_seconds = 0.250
         local_budget = self.plan.get("memory_budgets", {}).get(self.client.local_node, 0)
@@ -381,6 +382,10 @@ class TensorStore:
             raise TrainPoolError("TensorStore is closed")
         if self._lease_error:
             raise TrainPoolError(f"TRAINPOOL_LEASE_RENEWAL_FAILED: {self._lease_error}")
+        now = time.monotonic()
+        if now - self._last_job_check >= self._metrics_interval_seconds:
+            self.client.control("job_status", job_id=self.job_id)
+            self._last_job_check = now
 
     def _renew_loop(self):
         period = max(1, self.client.status["lease_seconds"] / 3)
@@ -439,14 +444,14 @@ class TensorStore:
                 def chunks(offset=offset, size=size):
                     for start in range(offset, offset + size, 65536):
                         length = min(65536, offset + size - start)
-                        with self.client.staging(length):
-                            chunk = raw[start : start + length].to("cpu")
-                            yield memoryview(chunk.numpy())
-                            del chunk
+                        chunk = raw[start : start + length].to("cpu")
+                        yield memoryview(chunk.numpy())
+                        del chunk
 
-                block = self.client.put_chunks(
-                    size, chunks(), self.job_id, preferred_node=self.preferred_node
-                )
+                with self.client.staging(min(size, 65536)):
+                    block = self.client.put_chunks(
+                        size, chunks(), self.job_id, preferred_node=self.preferred_node
+                    )
                 new_blocks.append(block)
                 with self._lock:
                     handle.blocks.append(block)
@@ -548,7 +553,6 @@ class TensorStore:
         self._check()
         if handle.dirty:
             raise TrainPoolError("Tensor upload is not complete")
-        self.client.control("job_status", job_id=self.job_id)
         target = torch.device(device or handle.device)
         self._require_cuda(target)
         if target.type not in {"cpu", "cuda"}:

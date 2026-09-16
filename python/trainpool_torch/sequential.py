@@ -440,11 +440,10 @@ def _validate_model(model):
     for block in model:
         if list(block.buffers()):
             raise ValueError("Mutable/stateful buffers are unsupported; use pure stages")
-        if not getattr(block, "_trainpool_explicit_stage", False):
-            if any(
-                type(module) not in allowed or getattr(module, "inplace", False) for module in block.modules()
-            ):
-                raise ValueError("Unknown stage: annotate a pure block with trainpool_torch.stage()")
+        if not getattr(block, "_trainpool_explicit_stage", False) and any(
+            type(module) not in allowed or getattr(module, "inplace", False) for module in block.modules()
+        ):
+            raise ValueError("Unknown stage: annotate a pure block with trainpool_torch.stage()")
     return all_parameters
 
 

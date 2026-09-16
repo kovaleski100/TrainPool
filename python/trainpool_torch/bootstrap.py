@@ -175,14 +175,13 @@ def _activate_model(model, requested_device):
         raise TrainPoolError("TRAINPOOL_NO_CUDA: CUDA was requested but is unavailable")
     store = TensorStore(preferred_node=None)
     try:
-        if not test_cpu:
-            if (
-                store.plan["strategy"] != "SingleGpuDistributedMemory"
-                or store.client.local_node not in store.plan["compute_nodes"]
-            ):
-                raise TrainPoolError(
-                    "TRAINPOOL_NO_CUDA: transparent FULL mode must run on the selected primary GPU node"
-                )
+        if not test_cpu and (
+            store.plan["strategy"] != "SingleGpuDistributedMemory"
+            or store.client.local_node not in store.plan["compute_nodes"]
+        ):
+            raise TrainPoolError(
+                "TRAINPOOL_NO_CUDA: transparent FULL mode must run on the selected primary GPU node"
+            )
         if not test_cpu:
             assignment = store.plan["gpu_assignments"][0]
             eligible = [
