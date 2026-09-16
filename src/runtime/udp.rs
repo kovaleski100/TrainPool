@@ -8,6 +8,7 @@ use crate::{
 use anyhow::{Result, ensure};
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
@@ -73,6 +74,33 @@ fn completed_data_ack(request: &Packet, window: usize) -> Packet {
 }
 
 impl Runtime {
+    pub(crate) async fn track_udp_transfer<T>(
+        &self,
+        job: Uuid,
+        transfer: impl Future<Output = Result<(T, crate::transport::udp::TransferStats)>>,
+    ) -> Result<T> {
+        {
+            let mut all = self.metrics.lock().await;
+            let metrics = all.job(job);
+            metrics.transfer_sessions += 1;
+            metrics.active_transfer_sessions += 1;
+        }
+        let result = transfer.await;
+        let mut all = self.metrics.lock().await;
+        let metrics = all.job(job);
+        metrics.active_transfer_sessions = metrics.active_transfer_sessions.saturating_sub(1);
+        match result {
+            Ok((value, stats)) => {
+                self.apply_udp_stats(metrics, &stats);
+                Ok(value)
+            }
+            Err(error) => {
+                metrics.failed_transfers += 1;
+                Err(error)
+            }
+        }
+    }
+
     pub async fn udp_datagram(
         self: &Arc<Self>,
         socket: Arc<UdpSocket>,

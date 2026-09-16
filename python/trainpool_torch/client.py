@@ -59,6 +59,34 @@ def _check(response):
     return response.get("data")
 
 
+def _read_chunk(sock, handle, transfer, offset, buffer, total_size):
+    length = len(buffer)
+    _write_frame(
+        sock,
+        {
+            "op": "read_chunk",
+            "handle": handle,
+            "transfer_id": transfer,
+            "offset": offset,
+            "length": length,
+            "direct": False,
+        },
+    )
+    metadata = _check(_read_frame(sock))
+    expected = {
+        "transfer_id": transfer,
+        "object_id": handle["id"],
+        "offset": offset,
+        "length": length,
+        "total_size": total_size,
+    }
+    if any(metadata[key] != value for key, value in expected.items()):
+        raise TrainPoolError("invalid transfer metadata")
+    _receive_into(sock, buffer)
+    if blake3.blake3(buffer).hexdigest() != metadata["checksum"]:
+        raise TrainPoolError("TRAINPOOL_CHECKSUM_MISMATCH")
+
+
 class Client:
     def __init__(self, address=None, *, cluster_name=None, cluster_secret=None, timeout=120):
         address = address or os.getenv("TRAINPOOL_ADDRESS", "127.0.0.1:7432")
@@ -186,29 +214,7 @@ class Client:
         with self.connect() as sock:
             for offset in range(0, len(view), self.chunk_bytes):
                 chunk = view[offset : offset + self.chunk_bytes]
-                _write_frame(
-                    sock,
-                    {
-                        "op": "read_chunk",
-                        "handle": handle,
-                        "transfer_id": transfer,
-                        "offset": offset,
-                        "length": len(chunk),
-                        "direct": False,
-                    },
-                )
-                metadata = _check(_read_frame(sock))
-                if (
-                    metadata["transfer_id"] != transfer
-                    or metadata["object_id"] != handle["id"]
-                    or metadata["offset"] != offset
-                    or metadata["length"] != len(chunk)
-                    or metadata["total_size"] != len(view)
-                ):
-                    raise TrainPoolError("invalid transfer metadata")
-                _receive_into(sock, chunk)
-                if blake3.blake3(chunk).hexdigest() != metadata["checksum"]:
-                    raise TrainPoolError("TRAINPOOL_CHECKSUM_MISMATCH")
+                _read_chunk(sock, handle, transfer, offset, chunk, len(view))
                 digest.update(chunk)
         if digest.hexdigest() != handle["checksum"]:
             raise TrainPoolError("TRAINPOOL_CHECKSUM_MISMATCH: complete block")
@@ -227,30 +233,7 @@ class Client:
             for offset in range(0, handle["size"], chunk_bytes):
                 length = min(chunk_bytes, handle["size"] - offset)
                 buffer = bytearray(length)
-                _write_frame(
-                    sock,
-                    {
-                        "op": "read_chunk",
-                        "handle": handle,
-                        "transfer_id": transfer,
-                        "offset": offset,
-                        "length": length,
-                        "direct": False,
-                    },
-                )
-                metadata = _check(_read_frame(sock))
-                expected = {
-                    "transfer_id": transfer,
-                    "object_id": handle["id"],
-                    "offset": offset,
-                    "length": length,
-                    "total_size": handle["size"],
-                }
-                if any(metadata[key] != value for key, value in expected.items()):
-                    raise TrainPoolError("invalid transfer metadata")
-                _receive_into(sock, buffer)
-                if blake3.blake3(buffer).hexdigest() != metadata["checksum"]:
-                    raise TrainPoolError("TRAINPOOL_CHECKSUM_MISMATCH")
+                _read_chunk(sock, handle, transfer, offset, buffer, handle["size"])
                 digest.update(buffer)
                 yield buffer
                 del buffer

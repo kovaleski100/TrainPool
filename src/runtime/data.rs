@@ -1,8 +1,11 @@
 use super::Runtime;
 use crate::{
-    memory::block::BlockState,
+    memory::{
+        block::BlockState,
+        remote_ram::{read_chunk_from, write_chunk_to},
+    },
     protocol::{Request, Response},
-    transport::{Transport, read_frame, write_frame},
+    transport::{Transport, write_frame},
 };
 use anyhow::{Result, ensure};
 use std::net::SocketAddr;
@@ -12,6 +15,16 @@ use tokio::{
 };
 
 impl Runtime {
+    async fn peer_capabilities(&self, node: uuid::Uuid) -> Result<crate::node::NodeCapabilities> {
+        self.membership
+            .read()
+            .await
+            .peers
+            .get(&node)
+            .map(|peer| peer.capabilities.clone())
+            .ok_or_else(|| anyhow::anyhow!("TRAINPOOL_NODE_UNAVAILABLE"))
+    }
+
     async fn acquire_tcp_data(&self, address: SocketAddr) -> Result<(TcpStream, bool)> {
         if let Some(stream) = self
             .tcp_data_pool
@@ -48,25 +61,7 @@ impl Runtime {
             metrics.tcp_connections_opened += u64::from(!reused);
             metrics.tcp_connections_reused += u64::from(reused);
         }
-        let result = async {
-            write_frame(
-                &mut stream,
-                &Request::WriteChunk {
-                    handle: handle.clone(),
-                    transfer_id,
-                    offset,
-                    length: payload.len(),
-                    total_size: handle.size,
-                    checksum: blake3::hash(payload).to_hex().to_string(),
-                    direct: true,
-                },
-            )
-            .await?;
-            read_frame::<Response>(&mut stream).await?.check()?;
-            stream.write_all(payload).await?;
-            read_frame::<Response>(&mut stream).await?.check()
-        }
-        .await;
+        let result = write_chunk_to(&mut stream, handle, transfer_id, offset, payload).await;
         if result.is_ok() {
             self.release_tcp_data(address, stream).await;
         }
@@ -88,29 +83,7 @@ impl Runtime {
             metrics.tcp_connections_opened += u64::from(!reused);
             metrics.tcp_connections_reused += u64::from(reused);
         }
-        let result = async {
-            write_frame(
-                &mut stream,
-                &Request::ReadChunk {
-                    handle: handle.clone(),
-                    transfer_id,
-                    offset,
-                    length,
-                    direct: true,
-                },
-            )
-            .await?;
-            let metadata: serde_json::Value =
-                read_frame::<Response>(&mut stream).await?.into_data()?;
-            let mut payload = vec![0; length];
-            stream.read_exact(&mut payload).await?;
-            ensure!(
-                metadata["checksum"].as_str() == Some(blake3::hash(&payload).to_hex().as_str()),
-                "TRAINPOOL_CHECKSUM_MISMATCH"
-            );
-            Ok(payload)
-        }
-        .await;
+        let result = read_chunk_from(&mut stream, handle, transfer_id, offset, length).await;
         if result.is_ok() {
             self.release_tcp_data(address, stream).await;
         }
@@ -171,14 +144,7 @@ impl Runtime {
                         b.written = end;
                     } else {
                         let start = std::time::Instant::now();
-                        let node = self
-                            .membership
-                            .read()
-                            .await
-                            .peers
-                            .get(&h.owner_node)
-                            .map(|peer| peer.capabilities.clone())
-                            .ok_or_else(|| anyhow::anyhow!("TRAINPOOL_NODE_UNAVAILABLE"))?;
+                        let node = self.peer_capabilities(h.owner_node).await?;
                         if self.config.data_transport == "udp"
                             && node.network.data_transport == "udp"
                         {
@@ -186,26 +152,14 @@ impl Runtime {
                                 .network
                                 .data_address
                                 .unwrap_or(node.network.control_address);
-                            let mut all = self.metrics.lock().await;
-                            let metrics = all.job(h.job_id);
-                            metrics.transfer_sessions += 1;
-                            metrics.active_transfer_sessions += 1;
-                            drop(all);
-                            let result = self
-                                .reliable_udp()
-                                .write(address, &h, transfer_id, offset, &payload)
-                                .await;
-                            let mut all = self.metrics.lock().await;
-                            let metrics = all.job(h.job_id);
-                            metrics.active_transfer_sessions =
-                                metrics.active_transfer_sessions.saturating_sub(1);
-                            match result {
-                                Ok(stats) => self.apply_udp_stats(metrics, &stats),
-                                Err(error) => {
-                                    metrics.failed_transfers += 1;
-                                    return Err(error);
-                                }
-                            }
+                            let udp = self.reliable_udp();
+                            self.track_udp_transfer(h.job_id, async {
+                                let stats = udp
+                                    .write(address, &h, transfer_id, offset, &payload)
+                                    .await?;
+                                Ok(((), stats))
+                            })
+                            .await?;
                         } else {
                             self.tcp_write_chunk(
                                 node.network.control_address,
@@ -292,14 +246,7 @@ impl Runtime {
                         ensure!(end <= b.bytes.len(), "read exceeds allocation");
                         b.bytes[begin..end].to_vec()
                     } else {
-                        let node = self
-                            .membership
-                            .read()
-                            .await
-                            .peers
-                            .get(&h.owner_node)
-                            .map(|peer| peer.capabilities.clone())
-                            .ok_or_else(|| anyhow::anyhow!("TRAINPOOL_NODE_UNAVAILABLE"))?;
+                        let node = self.peer_capabilities(h.owner_node).await?;
                         let payload = if self.config.data_transport == "udp"
                             && node.network.data_transport == "udp"
                         {
@@ -307,29 +254,12 @@ impl Runtime {
                                 .network
                                 .data_address
                                 .unwrap_or(node.network.control_address);
-                            let mut all = self.metrics.lock().await;
-                            let metrics = all.job(h.job_id);
-                            metrics.transfer_sessions += 1;
-                            metrics.active_transfer_sessions += 1;
-                            drop(all);
-                            let result = self
-                                .reliable_udp()
-                                .read(address, &h, transfer_id, offset, length)
-                                .await;
-                            let mut all = self.metrics.lock().await;
-                            let metrics = all.job(h.job_id);
-                            metrics.active_transfer_sessions =
-                                metrics.active_transfer_sessions.saturating_sub(1);
-                            match result {
-                                Ok((payload, stats)) => {
-                                    self.apply_udp_stats(metrics, &stats);
-                                    payload
-                                }
-                                Err(error) => {
-                                    metrics.failed_transfers += 1;
-                                    return Err(error);
-                                }
-                            }
+                            let udp = self.reliable_udp();
+                            self.track_udp_transfer(
+                                h.job_id,
+                                udp.read(address, &h, transfer_id, offset, length),
+                            )
+                            .await?
                         } else {
                             self.tcp_read_chunk(
                                 node.network.control_address,

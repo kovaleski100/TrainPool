@@ -65,27 +65,15 @@ pub async fn migrate(
         for (index, bytes) in b.bytes.chunks(chunk).enumerate() {
             if runtime.config.data_transport == "udp" && node.network.data_transport == "udp" {
                 let offset = (index * chunk) as u64;
-                {
-                    let mut all = runtime.metrics.lock().await;
-                    let metrics = all.job(handle.job_id);
-                    metrics.transfer_sessions += 1;
-                    metrics.active_transfer_sessions += 1;
-                }
-                let result = runtime
-                    .reliable_udp()
-                    .write(data_address, &target, transfer, offset, bytes)
-                    .await;
-                let mut all = runtime.metrics.lock().await;
-                let metrics = all.job(handle.job_id);
-                metrics.active_transfer_sessions =
-                    metrics.active_transfer_sessions.saturating_sub(1);
-                match result {
-                    Ok(stats) => runtime.apply_udp_stats(metrics, &stats),
-                    Err(error) => {
-                        metrics.failed_transfers += 1;
-                        return Err(error);
-                    }
-                }
+                let udp = runtime.reliable_udp();
+                runtime
+                    .track_udp_transfer(handle.job_id, async {
+                        let stats = udp
+                            .write(data_address, &target, transfer, offset, bytes)
+                            .await?;
+                        Ok(((), stats))
+                    })
+                    .await?;
             } else {
                 runtime
                     .tcp_write_chunk(address, &target, transfer, (index * chunk) as u64, bytes)

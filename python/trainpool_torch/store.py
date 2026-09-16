@@ -432,6 +432,10 @@ class TensorStore:
             self.metrics["peak_remote_ram_backing_bytes"], remote
         )
 
+    def _split_backing(self, blocks, size):
+        local = sum(block["size"] for block in blocks if block["owner_node"] == self.client.local_node)
+        return local, size - local
+
     def _write_backing(self, value, handle):
         import torch
 
@@ -480,8 +484,7 @@ class TensorStore:
         except BaseException:
             handle.dirty = False
             raise
-        local = sum(block["size"] for block in blocks if block["owner_node"] == self.client.local_node)
-        remote = handle.size - local
+        local, remote = self._split_backing(blocks, handle.size)
         handle.transfer_cost = 4.0 if remote else 1.0
         self.metrics["bytes_gpu_to_local_ram"] += local
         self.metrics["gpu_to_local_bytes"] += local
@@ -533,10 +536,7 @@ class TensorStore:
             with self._lock:
                 handle.dirty = False
                 if tensor.device.type == "cuda":
-                    local = sum(
-                        block["size"] for block in blocks if block["owner_node"] == self.client.local_node
-                    )
-                    remote = handle.size - local
+                    local, remote = self._split_backing(blocks, handle.size)
                     handle.transfer_cost = 4.0 if remote else 1.0
                     self.metrics["bytes_gpu_to_local_ram"] += local
                     self.metrics["gpu_to_local_bytes"] += local
@@ -578,10 +578,7 @@ class TensorStore:
                 del source, buffer
         with self._lock:
             if target.type == "cuda":
-                local = sum(
-                    block["size"] for block in handle.blocks if block["owner_node"] == self.client.local_node
-                )
-                remote = handle.size - local
+                local, remote = self._split_backing(handle.blocks, handle.size)
                 handle.transfer_cost = 4.0 if remote else 1.0
                 self.metrics["bytes_local_ram_to_gpu"] += local
                 self.metrics["local_to_gpu_bytes"] += local
