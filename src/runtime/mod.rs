@@ -169,7 +169,9 @@ impl Runtime {
     pub async fn serve(self: Arc<Self>, listener: TcpListener) -> Result<()> {
         let permits = Arc::new(Semaphore::new(64));
         let udp_permits = Arc::new(Semaphore::new(256));
-        let udp = Arc::new(tokio::net::UdpSocket::bind(listener.local_addr()?).await?);
+        let udp_socket = tokio::net::UdpSocket::bind(listener.local_addr()?).await?;
+        crate::transport::udp_io::enable_gro(&udp_socket);
+        let udp = Arc::new(udp_socket);
         loop {
             tokio::select! {
                 accepted = listener.accept() => {
@@ -189,22 +191,18 @@ impl Runtime {
                         }
                     });
                 }
-                received = async {
-                    let mut buffer = vec![0_u8; crate::transport::udp::MAX_DATAGRAM];
-                    let (size, source) = udp.recv_from(&mut buffer).await?;
-                    buffer.truncate(size);
-                    Ok::<_, std::io::Error>((buffer, source))
-                } => {
-                    let (datagram, source) = received?;
-                    // Concurrency hides per-datagram integrity and metrics costs,
-                    // while the semaphore provides a hard bound on queued tasks
-                    // and naturally backpressures the kernel receive queue.
-                    let permit = udp_permits.clone().acquire_owned().await?;
+                received = crate::transport::udp_io::receive_batch(&udp) => {
+                    let batch = received?;
+                    // Process a GRO batch in one task to avoid scheduler and
+                    // lock contention while permits preserve datagram-level
+                    // backpressure against the kernel receive queue.
+                    let permits = batch.datagrams.len().try_into().unwrap_or(u32::MAX);
+                    let permit = udp_permits.clone().acquire_many_owned(permits).await?;
                     let this = self.clone();
                     let socket = udp.clone();
                     tokio::spawn(async move {
                         let _permit = permit;
-                        this.udp_datagram(socket, datagram, source).await;
+                        this.udp_datagrams(socket, batch.datagrams, batch.source).await;
                     });
                 }
             }

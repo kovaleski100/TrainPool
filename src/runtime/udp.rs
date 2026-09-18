@@ -2,7 +2,8 @@ use super::Runtime;
 use crate::{
     memory::{allocator::Reservation, block::BlockState},
     transport::udp::{
-        ACK_BITS, Kind, Packet, ReliableUdpDataTransport, SendPayload, bitmap_payload, send_payload,
+        ACK_BITS, Kind, Packet, ReliableUdpDataTransport, SendPayload, bind_for_peer,
+        bitmap_payload, send_payload,
     },
 };
 use anyhow::{Result, ensure};
@@ -133,6 +134,172 @@ impl Runtime {
         }
     }
 
+    pub async fn udp_datagrams(
+        self: &Arc<Self>,
+        socket: Arc<UdpSocket>,
+        datagrams: Vec<Vec<u8>>,
+        source: SocketAddr,
+    ) {
+        if datagrams.len() <= 1 {
+            if let Some(datagram) = datagrams.into_iter().next() {
+                self.udp_datagram(socket, datagram, source).await;
+            }
+            return;
+        }
+        let decoded: Result<Vec<_>> = datagrams
+            .iter()
+            .map(|datagram| Packet::decode(datagram, self.config.cluster_secret.as_deref()))
+            .collect();
+        let Ok(packets) = decoded else {
+            for datagram in datagrams {
+                self.udp_datagram(socket.clone(), datagram, source).await;
+            }
+            return;
+        };
+        let first = &packets[0];
+        let is_data_batch = packets.iter().all(|packet| {
+            packet.kind == Kind::Data
+                && packet.transfer_id == first.transfer_id
+                && packet.object_id == first.object_id
+                && packet.block_id == first.block_id
+        });
+        if !is_data_batch {
+            for datagram in datagrams {
+                self.udp_datagram(socket.clone(), datagram, source).await;
+            }
+            return;
+        }
+        self.metrics
+            .lock()
+            .await
+            .job(first.object_id)
+            .udp_datagrams_received += packets.len() as u64;
+        if let Err(error) = self.handle_udp_data_batch(&socket, &packets, source).await {
+            let reply = response(first, Kind::Error, error.to_string().into_bytes());
+            if let Ok(wire) = reply.encode(self.config.cluster_secret.as_deref()) {
+                let _ = socket.send_to(&wire, source).await;
+                self.metrics
+                    .lock()
+                    .await
+                    .job(first.object_id)
+                    .udp_datagrams_sent += 1;
+            }
+        }
+    }
+
+    async fn handle_udp_data_batch(
+        &self,
+        socket: &UdpSocket,
+        packets: &[Packet],
+        source: SocketAddr,
+    ) -> Result<()> {
+        let first = &packets[0];
+        let last = packets.last().expect("non-empty UDP batch");
+        let key = SessionKey {
+            source,
+            transfer: first.transfer_id,
+            block: first.block_id,
+        };
+        let completed_base = first
+            .offset
+            .checked_sub(first.sequence_id as u64 * self.config.udp_payload_bytes as u64);
+        let already_completed = if let Some(base) = completed_base {
+            self.udp_server
+                .completed
+                .lock()
+                .await
+                .contains_key(&(key, base))
+        } else {
+            false
+        };
+        if already_completed {
+            return self
+                .send_udp_response(
+                    socket,
+                    source,
+                    completed_data_ack(last, self.config.udp_window_packets),
+                )
+                .await;
+        }
+
+        let mut duplicate_count = 0_u64;
+        let mut out_of_order_count = 0_u64;
+        let mut payload_bytes = 0_u64;
+        let ack_payload = {
+            let mut sessions = self.udp_server.incoming.lock().await;
+            let Some(session) = sessions.get_mut(&key) else {
+                drop(sessions);
+                if self.udp_server.finishing.lock().await.contains(&key) {
+                    return self
+                        .send_udp_response(
+                            socket,
+                            source,
+                            completed_data_ack(last, self.config.udp_window_packets),
+                        )
+                        .await;
+                }
+                anyhow::bail!("stale UDP transfer ID");
+            };
+            for packet in packets {
+                ensure!(
+                    packet.object_id == session.object
+                        && packet.lease_token == session.lease
+                        && packet.generation == session.generation
+                        && packet.total_size == session.block_size,
+                    "UDP session metadata changed"
+                );
+                let sequence = packet.sequence_id as usize;
+                ensure!(
+                    sequence < session.packet_count,
+                    "UDP sequence outside session"
+                );
+                let begin = sequence * session.payload_size;
+                ensure!(
+                    packet.offset == session.base_offset + begin as u64,
+                    "UDP packet offset mismatch"
+                );
+                ensure!(
+                    begin + packet.payload.len() <= session.buffer.len(),
+                    "UDP payload range mismatch"
+                );
+                if session.received[sequence] {
+                    duplicate_count += 1;
+                    continue;
+                }
+                if session
+                    .last_sequence
+                    .is_some_and(|previous| sequence < previous)
+                {
+                    out_of_order_count += 1;
+                }
+                session.buffer[begin..begin + packet.payload.len()]
+                    .copy_from_slice(&packet.payload);
+                session.received[sequence] = true;
+                session.received_count += 1;
+                session.last_sequence = Some(sequence);
+                payload_bytes += packet.payload.len() as u64;
+            }
+            session.last_activity = Instant::now();
+            let sequence = last.sequence_id as usize;
+            let base = (sequence / ACK_BITS) * ACK_BITS;
+            let bits: Vec<_> = (base..base + ACK_BITS)
+                .map(|index| session.received.get(index).copied().unwrap_or(false))
+                .collect();
+            bitmap_payload(base as u32, &bits, self.config.udp_window_packets)
+        };
+        {
+            let mut all = self.metrics.lock().await;
+            let metrics = all.job(first.object_id);
+            metrics.udp_payload_bytes += payload_bytes;
+            metrics.duplicate_datagrams += duplicate_count;
+            metrics.out_of_order_datagrams += out_of_order_count;
+        }
+        self.send_udp_response(socket, source, response(last, Kind::Ack, ack_payload))
+            .await?;
+        self.metrics.lock().await.job(first.object_id).ack_count += 1;
+        Ok(())
+    }
+
     async fn send_udp_response(
         &self,
         socket: &UdpSocket,
@@ -214,12 +381,7 @@ impl Runtime {
                 let offset = packet.offset;
                 tokio::spawn(async move {
                     let result = async {
-                        let sender = UdpSocket::bind(if destination.is_ipv4() {
-                            "0.0.0.0:0"
-                        } else {
-                            "[::]:0"
-                        })
-                        .await?;
+                        let sender = bind_for_peer(destination).await?;
                         send_payload(
                             &sender,
                             destination,

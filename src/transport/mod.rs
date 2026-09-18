@@ -17,6 +17,7 @@ use tokio::{
 use uuid::Uuid;
 
 pub mod udp;
+pub(crate) mod udp_io;
 
 pub async fn write_frame<T: Serialize>(
     stream: &mut (impl AsyncWrite + Unpin),

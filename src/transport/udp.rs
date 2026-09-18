@@ -4,7 +4,11 @@
 //! integrity checked and, when a cluster secret exists, authenticated. Payload
 //! transfers use a bounded selective-repeat window and bitmap acknowledgements.
 
-use crate::{config::Config, memory::block::MemoryBlockHandle};
+use crate::{
+    config::Config,
+    memory::block::MemoryBlockHandle,
+    transport::udp_io::{enable_gro, max_gso_segments, receive_batch, send_segmented},
+};
 use anyhow::{Result, ensure};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -256,12 +260,7 @@ impl ReliableUdpDataTransport {
         offset: u64,
         payload: &[u8],
     ) -> Result<TransferStats> {
-        let socket = UdpSocket::bind(if destination.is_ipv4() {
-            "0.0.0.0:0"
-        } else {
-            "[::]:0"
-        })
-        .await?;
+        let socket = bind_for_peer(destination).await?;
         send_payload(
             &socket,
             destination,
@@ -289,12 +288,7 @@ impl ReliableUdpDataTransport {
             length <= self.config.chunk_bytes,
             "UDP read exceeds configured chunk size"
         );
-        let socket = UdpSocket::bind(if destination.is_ipv4() {
-            "0.0.0.0:0"
-        } else {
-            "[::]:0"
-        })
-        .await?;
+        let socket = bind_for_peer(destination).await?;
         let mut request = Packet::for_handle(Kind::ReadRequest, handle, transfer_id);
         request.offset = offset;
         request.sequence_id = length.try_into()?;
@@ -303,29 +297,30 @@ impl ReliableUdpDataTransport {
         let mut retries = 0;
         loop {
             socket.send_to(&wire, destination).await?;
-            let mut datagram = [0_u8; MAX_DATAGRAM];
             match tokio::time::timeout(
                 Duration::from_millis(self.config.udp_initial_rto_ms),
-                socket.recv_from(&mut datagram),
+                receive_batch(&socket),
             )
             .await
             {
-                Ok(Ok((size, source))) => {
-                    let start =
-                        Packet::decode(&datagram[..size], self.config.cluster_secret.as_deref())?;
-                    if start.transfer_id == transfer_id && start.kind == Kind::Start {
-                        return receive_payload(
-                            &socket,
-                            source,
-                            handle,
-                            start,
-                            &self.config,
-                            started,
-                        )
-                        .await;
-                    }
-                    if start.transfer_id == transfer_id && start.kind == Kind::Error {
-                        anyhow::bail!(String::from_utf8_lossy(&start.payload).into_owned());
+                Ok(Ok(batch)) => {
+                    for datagram in batch.datagrams {
+                        let start =
+                            Packet::decode(&datagram, self.config.cluster_secret.as_deref())?;
+                        if start.transfer_id == transfer_id && start.kind == Kind::Start {
+                            return receive_payload(
+                                &socket,
+                                batch.source,
+                                handle,
+                                start,
+                                &self.config,
+                                started,
+                            )
+                            .await;
+                        }
+                        if start.transfer_id == transfer_id && start.kind == Kind::Error {
+                            anyhow::bail!(String::from_utf8_lossy(&start.payload).into_owned());
+                        }
                     }
                 }
                 _ => {
@@ -338,6 +333,17 @@ impl ReliableUdpDataTransport {
             }
         }
     }
+}
+
+pub(crate) async fn bind_for_peer(destination: SocketAddr) -> std::io::Result<UdpSocket> {
+    let socket = UdpSocket::bind(if destination.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    })
+    .await?;
+    enable_gro(&socket);
+    Ok(socket)
 }
 
 pub async fn send_payload(
@@ -414,30 +420,31 @@ async fn send_payload_inner(
     let mut rttvar = 0.0;
     let handshake_started = Instant::now();
     let mut retries = 0;
-    loop {
+    'handshake: loop {
         socket.send_to(&start_wire, destination).await?;
         stats.datagrams_sent += 1;
-        let mut datagram = [0_u8; MAX_DATAGRAM];
-        match tokio::time::timeout(rto, socket.recv_from(&mut datagram)).await {
-            Ok(Ok((size, source))) if source == destination => {
-                let packet = Packet::decode(&datagram[..size], config.cluster_secret.as_deref())?;
-                stats.datagrams_received += 1;
-                if packet.transfer_id == transfer_id && packet.kind == Kind::StartAck {
-                    stats.ack_count += 1;
-                    if packet.payload.len() == 2 {
-                        let receiver_window =
-                            u16::from_be_bytes(packet.payload[..2].try_into()?) as usize;
-                        negotiated_window = negotiated_window.min(receiver_window.max(2));
+        match tokio::time::timeout(rto, receive_batch(socket)).await {
+            Ok(Ok(batch)) if batch.source == destination => {
+                for datagram in batch.datagrams {
+                    let packet = Packet::decode(&datagram, config.cluster_secret.as_deref())?;
+                    stats.datagrams_received += 1;
+                    if packet.transfer_id == transfer_id && packet.kind == Kind::StartAck {
+                        stats.ack_count += 1;
+                        if packet.payload.len() == 2 {
+                            let receiver_window =
+                                u16::from_be_bytes(packet.payload[..2].try_into()?) as usize;
+                            negotiated_window = negotiated_window.min(receiver_window.max(2));
+                        }
+                        if retries == 0 {
+                            let sample = handshake_started.elapsed().as_secs_f64() * 1000.0;
+                            rto = update_rto(sample, &mut srtt, &mut rttvar);
+                            stats.estimated_rtt_ms = sample;
+                        }
+                        break 'handshake;
                     }
-                    if retries == 0 {
-                        let sample = handshake_started.elapsed().as_secs_f64() * 1000.0;
-                        rto = update_rto(sample, &mut srtt, &mut rttvar);
-                        stats.estimated_rtt_ms = sample;
+                    if packet.transfer_id == transfer_id && packet.kind == Kind::Error {
+                        anyhow::bail!(String::from_utf8_lossy(&packet.payload).into_owned());
                     }
-                    break;
-                }
-                if packet.transfer_id == transfer_id && packet.kind == Kind::Error {
-                    anyhow::bail!(String::from_utf8_lossy(&packet.payload).into_owned());
                 }
             }
             _ => {
@@ -461,8 +468,13 @@ async fn send_payload_inner(
             let round_started = Instant::now();
             let mut sampled_round = false;
             let mut sent_in_round = 0_u64;
+            let mut paced_at = 0_u64;
             let loss_backoff = 1_u64 << round.min(4);
             let pacing_interval = config.udp_pacing_micros.saturating_mul(loss_backoff);
+            let segment_size = HEADER_LEN + config.udp_payload_bytes;
+            let batch_limit = max_gso_segments(segment_size);
+            let mut encoded = Vec::with_capacity(segment_size * batch_limit);
+            let mut encoded_segments = 0_usize;
             for (sequence, is_acknowledged) in acknowledged.iter().enumerate().take(end).skip(base)
             {
                 if *is_acknowledged {
@@ -476,7 +488,8 @@ async fn send_payload_inner(
                 packet.offset = offset + begin as u64;
                 packet.payload = payload[begin..finish].to_vec();
                 let wire = packet.encode(config.cluster_secret.as_deref())?;
-                socket.send_to(&wire, destination).await?;
+                encoded.extend_from_slice(&wire);
+                encoded_segments += 1;
                 stats.datagrams_sent += 1;
                 if round > 0 {
                     stats.retransmitted_datagrams += 1;
@@ -485,73 +498,93 @@ async fn send_payload_inner(
                     stats.payload_bytes += packet.payload.len() as u64;
                 }
                 sent_in_round += 1;
-                // Pace bounded bursts against a monotonic target. Sub-millisecond
-                // sleeps are commonly rounded up, so one timer per datagram would
-                // accidentally throttle the LAN by orders of magnitude.
-                if sent_in_round.is_multiple_of(32) {
+                if encoded_segments == batch_limit {
+                    send_segmented(
+                        socket,
+                        destination,
+                        &encoded,
+                        segment_size,
+                        encoded_segments,
+                    )
+                    .await?;
+                    encoded.clear();
+                    encoded_segments = 0;
                     let target =
                         Duration::from_micros(pacing_interval.saturating_mul(sent_in_round));
                     if let Some(delay) = target.checked_sub(round_started.elapsed()) {
                         tokio::time::sleep(delay).await;
                     }
+                    paced_at = sent_in_round;
                 }
             }
-            let target = Duration::from_micros(pacing_interval.saturating_mul(sent_in_round));
-            if let Some(delay) = target.checked_sub(round_started.elapsed()) {
-                tokio::time::sleep(delay).await;
+            if encoded_segments > 0 {
+                send_segmented(
+                    socket,
+                    destination,
+                    &encoded,
+                    segment_size,
+                    encoded_segments,
+                )
+                .await?;
+            }
+            if paced_at != sent_in_round {
+                let target = Duration::from_micros(pacing_interval.saturating_mul(sent_in_round));
+                if let Some(delay) = target.checked_sub(round_started.elapsed()) {
+                    tokio::time::sleep(delay).await;
+                }
             }
             let deadline = Instant::now() + rto;
             while Instant::now() < deadline && acknowledged[base..end].iter().any(|value| !*value) {
-                let mut datagram = [0_u8; MAX_DATAGRAM];
                 let remaining = deadline.saturating_duration_since(Instant::now());
-                let Ok(Ok((size, source))) =
-                    tokio::time::timeout(remaining, socket.recv_from(&mut datagram)).await
+                let Ok(Ok(batch)) = tokio::time::timeout(remaining, receive_batch(socket)).await
                 else {
                     break;
                 };
-                if source != destination {
+                if batch.source != destination {
                     continue;
                 }
-                let packet = Packet::decode(&datagram[..size], config.cluster_secret.as_deref())?;
-                stats.datagrams_received += 1;
-                if packet.transfer_id != transfer_id {
-                    continue;
-                }
-                if packet.kind == Kind::Error {
-                    anyhow::bail!(String::from_utf8_lossy(&packet.payload).into_owned());
-                }
-                if matches!(packet.kind, Kind::Ack | Kind::Nack) {
-                    let (ack_base, bitmap, receiver_window) = parse_bitmap(&packet.payload)?;
-                    negotiated_window = negotiated_window.min(receiver_window.max(2));
-                    if packet.kind == Kind::Ack {
-                        stats.ack_count += 1;
-                        if round == 0 && !sampled_round {
-                            let sample = round_started.elapsed().as_secs_f64() * 1000.0;
-                            rto = update_rto(sample, &mut srtt, &mut rttvar);
-                            stats.estimated_rtt_ms = srtt.unwrap_or(sample);
-                            sampled_round = true;
-                        }
-                        for index in 0..ACK_BITS {
-                            let sequence = ack_base as usize + index;
-                            if sequence < packet_count && bitmap_contains(&bitmap, index) {
-                                acknowledged[sequence] = true;
+                for datagram in batch.datagrams {
+                    let packet = Packet::decode(&datagram, config.cluster_secret.as_deref())?;
+                    stats.datagrams_received += 1;
+                    if packet.transfer_id != transfer_id {
+                        continue;
+                    }
+                    if packet.kind == Kind::Error {
+                        anyhow::bail!(String::from_utf8_lossy(&packet.payload).into_owned());
+                    }
+                    if matches!(packet.kind, Kind::Ack | Kind::Nack) {
+                        let (ack_base, bitmap, receiver_window) = parse_bitmap(&packet.payload)?;
+                        negotiated_window = negotiated_window.min(receiver_window.max(2));
+                        if packet.kind == Kind::Ack {
+                            stats.ack_count += 1;
+                            if round == 0 && !sampled_round {
+                                let sample = round_started.elapsed().as_secs_f64() * 1000.0;
+                                rto = update_rto(sample, &mut srtt, &mut rttvar);
+                                stats.estimated_rtt_ms = srtt.unwrap_or(sample);
+                                sampled_round = true;
                             }
-                        }
-                    } else {
-                        stats.nack_count += 1;
-                        // NACK bits denote missing packets; every clear bit in
-                        // the reported range is known received. This preserves
-                        // selective retransmission rather than replaying a window.
-                        for index in 0..ACK_BITS {
-                            let sequence = ack_base as usize + index;
-                            if sequence >= base
-                                && sequence < end
-                                && !bitmap_contains(&bitmap, index)
-                            {
-                                acknowledged[sequence] = true;
+                            for index in 0..ACK_BITS {
+                                let sequence = ack_base as usize + index;
+                                if sequence < packet_count && bitmap_contains(&bitmap, index) {
+                                    acknowledged[sequence] = true;
+                                }
                             }
+                        } else {
+                            stats.nack_count += 1;
+                            // NACK bits denote missing packets; every clear bit in
+                            // the reported range is known received. This preserves
+                            // selective retransmission rather than replaying a window.
+                            for index in 0..ACK_BITS {
+                                let sequence = ack_base as usize + index;
+                                if sequence >= base
+                                    && sequence < end
+                                    && !bitmap_contains(&bitmap, index)
+                                {
+                                    acknowledged[sequence] = true;
+                                }
+                            }
+                            break;
                         }
-                        break;
                     }
                 }
             }
@@ -580,25 +613,25 @@ async fn send_payload_inner(
         if attempt > 0 {
             stats.retransmitted_datagrams += 1;
         }
-        let mut datagram = [0_u8; MAX_DATAGRAM];
-        if let Ok(Ok((size, source))) =
-            tokio::time::timeout(rto, socket.recv_from(&mut datagram)).await
-            && source == destination
+        if let Ok(Ok(batch)) = tokio::time::timeout(rto, receive_batch(socket)).await
+            && batch.source == destination
         {
-            let packet = Packet::decode(&datagram[..size], config.cluster_secret.as_deref())?;
-            stats.datagrams_received += 1;
-            if packet.transfer_id == transfer_id && packet.kind == Kind::Complete {
-                stats.ack_count += 1;
-                stats.retransmission_timeout_ms = rto.as_secs_f64() * 1000.0;
-                stats.estimated_rtt_ms = srtt.unwrap_or(stats.estimated_rtt_ms);
-                stats.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-                return Ok(stats);
-            }
-            if packet.transfer_id == transfer_id && packet.kind == Kind::Error {
-                anyhow::bail!(String::from_utf8_lossy(&packet.payload).into_owned());
-            }
-            if packet.transfer_id == transfer_id && packet.kind == Kind::Nack {
-                stats.nack_count += 1;
+            for datagram in batch.datagrams {
+                let packet = Packet::decode(&datagram, config.cluster_secret.as_deref())?;
+                stats.datagrams_received += 1;
+                if packet.transfer_id == transfer_id && packet.kind == Kind::Complete {
+                    stats.ack_count += 1;
+                    stats.retransmission_timeout_ms = rto.as_secs_f64() * 1000.0;
+                    stats.estimated_rtt_ms = srtt.unwrap_or(stats.estimated_rtt_ms);
+                    stats.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+                    return Ok(stats);
+                }
+                if packet.transfer_id == transfer_id && packet.kind == Kind::Error {
+                    anyhow::bail!(String::from_utf8_lossy(&packet.payload).into_owned());
+                }
+                if packet.transfer_id == transfer_id && packet.kind == Kind::Nack {
+                    stats.nack_count += 1;
+                }
             }
         }
         rto = (rto * 2).min(Duration::from_secs(2));
@@ -637,13 +670,12 @@ async fn receive_payload(
     let mut last_sequence = None;
     let mut retries = 0;
     loop {
-        let mut datagram = [0_u8; MAX_DATAGRAM];
         let received_packet = tokio::time::timeout(
             Duration::from_millis(config.udp_initial_rto_ms.max(20) * 4),
-            socket.recv_from(&mut datagram),
+            receive_batch(socket),
         )
         .await;
-        let Ok(Ok((size, peer))) = received_packet else {
+        let Ok(Ok(batch)) = received_packet else {
             retries += 1;
             ensure!(
                 retries <= config.udp_max_retries,
@@ -651,80 +683,91 @@ async fn receive_payload(
             );
             continue;
         };
-        if peer != source {
+        if batch.source != source {
             continue;
         }
-        let packet = Packet::decode(&datagram[..size], config.cluster_secret.as_deref())?;
-        stats.datagrams_received += 1;
-        if packet.transfer_id != start.transfer_id {
-            continue;
-        }
-        match packet.kind {
-            Kind::Data => {
-                let sequence = packet.sequence_id as usize;
-                ensure!(sequence < packet_count, "UDP sequence outside transfer");
-                let begin = sequence * config.udp_payload_bytes;
-                ensure!(
-                    begin + packet.payload.len() <= buffer.len(),
-                    "UDP data range invalid"
-                );
-                if received[sequence] {
-                    stats.duplicate_datagrams += 1;
-                } else {
-                    if last_sequence.is_some_and(|previous| sequence < previous) {
-                        stats.out_of_order_datagrams += 1;
+        let coalesced = batch.datagrams.len() > 1;
+        let mut ack_sequence = None;
+        for datagram in batch.datagrams {
+            let packet = Packet::decode(&datagram, config.cluster_secret.as_deref())?;
+            stats.datagrams_received += 1;
+            if packet.transfer_id != start.transfer_id {
+                continue;
+            }
+            match packet.kind {
+                Kind::Data => {
+                    let sequence = packet.sequence_id as usize;
+                    ensure!(sequence < packet_count, "UDP sequence outside transfer");
+                    let begin = sequence * config.udp_payload_bytes;
+                    ensure!(
+                        begin + packet.payload.len() <= buffer.len(),
+                        "UDP data range invalid"
+                    );
+                    if received[sequence] {
+                        stats.duplicate_datagrams += 1;
+                        ack_sequence = Some(sequence);
+                    } else {
+                        if last_sequence.is_some_and(|previous| sequence < previous) {
+                            stats.out_of_order_datagrams += 1;
+                        }
+                        buffer[begin..begin + packet.payload.len()]
+                            .copy_from_slice(&packet.payload);
+                        received[sequence] = true;
+                        received_count += 1;
+                        stats.payload_bytes += packet.payload.len() as u64;
+                        last_sequence = Some(sequence);
+                        if coalesced
+                            || received_count.is_multiple_of(8)
+                            || received_count == packet_count
+                        {
+                            ack_sequence = Some(sequence);
+                        }
                     }
-                    buffer[begin..begin + packet.payload.len()].copy_from_slice(&packet.payload);
-                    received[sequence] = true;
-                    received_count += 1;
-                    stats.payload_bytes += packet.payload.len() as u64;
-                    last_sequence = Some(sequence);
                 }
-                if received_count.is_multiple_of(8) || received_count == packet_count {
-                    let base = (sequence / ACK_BITS) * ACK_BITS;
-                    let bits: Vec<_> = (base..base + ACK_BITS)
-                        .map(|index| received.get(index).copied().unwrap_or(false))
-                        .collect();
-                    let mut response = Packet::for_handle(Kind::Ack, handle, start.transfer_id);
-                    response.payload =
-                        bitmap_payload(base as u32, &bits, config.udp_window_packets);
+                Kind::Fin if received_count == packet_count => {
+                    ensure!(
+                        packet.payload == start.payload[8..],
+                        "UDP FIN checksum changed"
+                    );
+                    ensure!(
+                        blake3::hash(&buffer).as_bytes() == &start.payload[8..],
+                        "TRAINPOOL_CHECKSUM_MISMATCH: UDP transfer"
+                    );
+                    let complete = Packet::for_handle(Kind::Complete, handle, start.transfer_id);
                     socket
-                        .send_to(&response.encode(config.cluster_secret.as_deref())?, source)
+                        .send_to(&complete.encode(config.cluster_secret.as_deref())?, source)
                         .await?;
                     stats.datagrams_sent += 1;
                     stats.ack_count += 1;
+                    stats.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+                    return Ok((buffer, stats));
                 }
+                Kind::Fin => {
+                    let bits: Vec<_> = received.iter().map(|value| !*value).collect();
+                    let mut nack = Packet::for_handle(Kind::Nack, handle, start.transfer_id);
+                    nack.payload = bitmap_payload(0, &bits, config.udp_window_packets);
+                    socket
+                        .send_to(&nack.encode(config.cluster_secret.as_deref())?, source)
+                        .await?;
+                    stats.datagrams_sent += 1;
+                    stats.nack_count += 1;
+                }
+                Kind::Abort | Kind::Error => anyhow::bail!("TRAINPOOL_TRANSFER_ABORTED"),
+                _ => {}
             }
-            Kind::Fin if received_count == packet_count => {
-                ensure!(
-                    packet.payload == start.payload[8..],
-                    "UDP FIN checksum changed"
-                );
-                ensure!(
-                    blake3::hash(&buffer).as_bytes() == &start.payload[8..],
-                    "TRAINPOOL_CHECKSUM_MISMATCH: UDP transfer"
-                );
-                let complete = Packet::for_handle(Kind::Complete, handle, start.transfer_id);
-                socket
-                    .send_to(&complete.encode(config.cluster_secret.as_deref())?, source)
-                    .await?;
-                stats.datagrams_sent += 1;
-                stats.ack_count += 1;
-                stats.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-                return Ok((buffer, stats));
-            }
-            Kind::Fin => {
-                let bits: Vec<_> = received.iter().map(|value| !*value).collect();
-                let mut nack = Packet::for_handle(Kind::Nack, handle, start.transfer_id);
-                nack.payload = bitmap_payload(0, &bits, config.udp_window_packets);
-                socket
-                    .send_to(&nack.encode(config.cluster_secret.as_deref())?, source)
-                    .await?;
-                stats.datagrams_sent += 1;
-                stats.nack_count += 1;
-            }
-            Kind::Abort | Kind::Error => anyhow::bail!("TRAINPOOL_TRANSFER_ABORTED"),
-            _ => {}
+        }
+        if let Some(sequence) = ack_sequence {
+            let base = (sequence / ACK_BITS) * ACK_BITS;
+            let bits: Vec<_> = (base..base + ACK_BITS)
+                .map(|index| received.get(index).copied().unwrap_or(false))
+                .collect();
+            let mut response = Packet::for_handle(Kind::Ack, handle, start.transfer_id);
+            response.payload = bitmap_payload(base as u32, &bits, config.udp_window_packets);
+            socket
+                .send_to(&response.encode(config.cluster_secret.as_deref())?, source)
+                .await?;
+            stats.datagrams_sent += 1;
+            stats.ack_count += 1;
         }
     }
 }
